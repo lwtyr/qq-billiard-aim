@@ -1,0 +1,7 @@
+# QQ 2D桌球 辅助瞄准器
+# Windows 玩家注意：如系统 python 无 tkinter，请装 python.org 官方安装包（自带 tkinter）。
+numpy>=1.26
+opencv-python-headless>=4.9
+mss>=9.0
+Pillow>=10.0
+pytest>=8.0
