@@ -178,7 +178,9 @@ class Overlay:
         self._region_start: Optional[tuple] = None
         self._region_current: Optional[tuple] = None
         if TRANSPARENT_ON_NT:
-            self.root.after(50, self._poll_frame_select)
+            # 框选是短时交互；50ms 轮询容易错过快速按下/松开，
+            # 尤其是在用户按 R 后立即开始拖拽时。
+            self.root.after(10, self._poll_frame_select)
             self._manual_active = False
             self._manual_pressed = False
             self.root.after(50, self._poll_manual_clicks)
@@ -261,7 +263,7 @@ class Overlay:
                         print(f"[框选] 完成回调出错: {e}", flush=True)
             except Exception as e:
                 print(f"[框选] 轮询异常: {e}", flush=True)
-        self.root.after(50, self._poll_frame_select)
+        self.root.after(10, self._poll_frame_select)
 
     # ---------- 全局热键（Windows） ----------
     _HOTKEYS = {

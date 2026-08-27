@@ -122,6 +122,27 @@ def test_capture_loop_retries_without_stopping_app(monkeypatch):
     assert app._capture_err is None
 
 
+def test_r_key_clears_old_capture_region_before_selection(monkeypatch):
+    """重新框选不能继续使用上一次错误/越界的捕获区域。"""
+    app = App.__new__(App)
+    app.cfg = config.Config(capture_region=[732, 668, 1036, 573])
+    app.region = list(app.cfg.capture_region)
+    app.mode = "auto"
+    app.scene = {}
+    app.overlay = None
+    app._set_click_through = lambda _on: None
+    app._reset_tracking = lambda: None
+    app._redetect = lambda: None
+    monkeypatch.setattr(app.cfg, "save", lambda: None)
+
+    app.on_key("r")
+
+    assert app.mode == "region"
+    assert app.region is None
+    assert app.cfg.capture_region is None
+    assert "全屏捕获" in app.scene["hint"]
+
+
 def test_analyze_hides_aim_until_ball_positions_settle():
     """跨帧确认期间只能显示球位，READY 后才允许输出瞄准线。"""
     img, _ = synth.random_layout(seed=12)

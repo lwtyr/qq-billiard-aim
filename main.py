@@ -1167,11 +1167,21 @@ class App:
                                   else "")
             self._redetect()
         elif keysym == "r":
+            # 重新框选必须脱离旧捕获区域，否则旧区域越界/错位时，
+            # 新框选完成后仍可能继续截取错误位置。R 模式始终从全屏开始。
+            if self.region is not None:
+                self.region = None
+                self.cfg.capture_region = None
+                self._reset_tracking()
+                try:
+                    self.cfg.save()
+                except OSError as exc:
+                    print(f"[框选] 无法保存全屏捕获状态: {exc}", flush=True)
             self.mode = "region"
             self._set_click_through(False)
             if self.overlay:
                 self.overlay.begin_region()
-            self.scene["hint"] = "框选绿色台面（可稍大一点）：按住左键拖到对角松开"
+            self.scene["hint"] = "已切换全屏捕获：框选绿色台面（可稍大一点），按住左键拖到对角松开"
         elif keysym == "k":
             cfg.allow_kicks = not cfg.allow_kicks
             cfg.save()
@@ -1282,6 +1292,20 @@ class App:
                 sx, sy = self._region_start
             x0, x1 = sorted((sx, x))
             y0, y1 = sorted((sy, y))
+            # GetCursorPos 使用屏幕坐标；拖拽过程中若越过屏幕边缘，
+            # 先裁剪再保存，避免产生下一次启动无法使用的越界区域。
+            if os.name == "nt":
+                try:
+                    import ctypes
+                    sw = int(ctypes.windll.user32.GetSystemMetrics(0))
+                    sh = int(ctypes.windll.user32.GetSystemMetrics(1))
+                    if sw > 0 and sh > 0:
+                        x0 = max(0, min(x0, sw - 1))
+                        y0 = max(0, min(y0, sh - 1))
+                        x1 = max(0, min(x1, sw))
+                        y1 = max(0, min(y1, sh))
+                except (AttributeError, OSError, TypeError, ValueError):
+                    pass
             if x1 - x0 > 40 and y1 - y0 > 40:
                 self.region = [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
                 self.cfg.capture_region = self.region
@@ -1292,6 +1316,7 @@ class App:
             else:
                 self.scene["hint"] = "区域太小，未修改"
             self.mode = "auto"
+            self._region_start = None
             self._set_click_through(True)
             self._redetect()
 
