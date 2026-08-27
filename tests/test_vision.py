@@ -198,6 +198,25 @@ def test_table_tracker_rejects_single_bad_recheck(monkeypatch):
     assert np.array_equal(first, third)
 
 
+def test_table_tracker_does_not_accumulate_subthreshold_noise(monkeypatch):
+    """静止球桌的连续小幅边缘噪声不能把锁定框逐步推走。"""
+    cfg = config.Config()
+    cfg.table_recheck_frames = 1
+    cfg.table_recheck_max_shift = 7.0
+    cfg.table_move_confirmations = 3
+    base = np.array([[10, 10], [990, 10], [990, 500], [10, 500]], dtype=np.float32)
+    noisy = np.array([[13, 12], [993, 12], [993, 503], [13, 503]], dtype=np.float32)
+    values = iter((base, noisy, noisy, noisy, noisy))
+    monkeypatch.setattr(vision, "find_table", lambda _frame, _cfg: next(values))
+    tracker = vision.TableTracker(cfg)
+    frame = np.zeros((500, 1000, 3), dtype=np.uint8)
+
+    first = tracker.update(frame).copy()
+    outputs = [tracker.update(frame).copy() for _ in range(4)]
+
+    assert all(np.array_equal(first, got) for got in outputs)
+
+
 def test_pocket_tracker_holds_single_candidate_jump():
     """单帧袋口候选跳点不应改变瞄准袋口。"""
     cfg = config.Config()

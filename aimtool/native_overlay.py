@@ -36,7 +36,7 @@ C_AIM = "#22c55e"             # 母球→鬼球（绿）
 C_TARGET = "#f97316"          # 鬼球→目标球（橙）
 C_POCKET = "#facc15"          # 目标球→袋口（黄）
 C_KICK = "#38bdf8"            # 库边反弹段（天蓝）
-C_GHOST = "#e2e8f0"           # 鬼球虚线圆
+C_GHOST = "#ffffff"           # 鬼球白色虚线圆
 C_EDGE = "#ffffff"
 C_TEXT = "#ffffff"
 C_TEXT_BG = "#111827"
@@ -378,7 +378,7 @@ class NativeLayer:
             r = float(g.get("r", scene.get("ball_r", 12)))
             gx, gy = float(g["x"]), float(g["y"])
             circ = self._circle_points(gx, gy, r, 64)
-            self._dashed(d, circ, C_AIM, 2, (10, 7))
+            self._dashed(d, circ, C_GHOST, 2, (10, 7))
             arm = max(5.0, min(10.0, 0.35 * r))
             d.line([(gx - arm, gy), (gx + arm, gy)], fill=C_GHOST, width=2)
             d.line([(gx, gy - arm), (gx, gy + arm)], fill=C_GHOST, width=2)

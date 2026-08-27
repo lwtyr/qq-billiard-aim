@@ -77,7 +77,7 @@ class Config:
     table_smooth_alpha: float = 0.55      # EMA 平滑系数（越大越信任新检测）
     table_max_miss: int = 5               # 连续检测失败 N 帧后强制解锁重检
     table_recheck_max_shift: float = 7.0  # 单次重检允许的像素偏移；更大需连续确认
-    table_stable_deadband: float = 2.0    # 小于该偏移视为检测噪声，保持锁定框
+    table_stable_deadband: float = 2.0    # 兼容旧配置；锁定框仅接受确认后的移动
     table_move_confirmations: int = 3    # 大偏移连续出现几次才接受为窗口移动
     table_max_edge_skew: float = 0.02     # QQ 2D 轴对齐台面允许的边缘斜率/透视
 

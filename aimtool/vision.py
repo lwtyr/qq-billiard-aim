@@ -1601,13 +1601,12 @@ class TableTracker:
                 self._jump = 0
                 self._jump_quad = None
             else:
+                # 锁定框是识别基准，不应把每次重检的 2~7px 边缘噪声
+                # 通过 EMA 累积成可见漂移。只有候选四边形越过
+                # jump_thresh，并连续确认，才在上面的分支中更新锁定框。
+                # 真实窗口移动会在后续重检中继续累积到该阈值。
                 self._jump = 0
                 self._jump_quad = None
-                deadband = max(
-                    0.5, float(getattr(self.cfg, "table_stable_deadband", 2.0)))
-                if shift > deadband:
-                    a = self.cfg.table_smooth_alpha
-                    self.quad = (a * q + (1.0 - a) * self.quad).astype(np.float32)
         return self.quad
 
 

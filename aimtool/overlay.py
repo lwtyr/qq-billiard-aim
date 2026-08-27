@@ -36,7 +36,7 @@ C_AIM = "#22c55e"             # 母球→鬼球（绿）
 C_TARGET = "#f97316"          # 鬼球→目标球（橙）
 C_POCKET = "#facc15"          # 目标球→袋口（黄）
 C_KICK = "#38bdf8"            # 库边反弹段（天蓝）
-C_GHOST = "#e2e8f0"           # 鬼球虚线圆
+C_GHOST = "#ffffff"           # 鬼球白色虚线圆
 C_EDGE = "#ffffff"
 C_TEXT = "#ffffff"
 C_TEXT_BG = "#111827"
@@ -624,7 +624,7 @@ class Overlay:
         if g:
             r = g.get("r", scene.get("ball_r", 12))
             c.create_oval(g["x"] - r, g["y"] - r, g["x"] + r, g["y"] + r,
-                          outline=C_AIM, width=2, dash=(10, 7))
+                          outline=C_GHOST, width=2, dash=(10, 7))
             # 鬼球中心是母球中心的瞄准点，用十字标出，避免只看虚线圆
             # 时无法判断应对准哪个像素。
             arm = max(5.0, min(10.0, 0.35 * r))
