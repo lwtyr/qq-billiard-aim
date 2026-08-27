@@ -143,6 +143,28 @@ def test_r_key_clears_old_capture_region_before_selection(monkeypatch):
     assert "全屏捕获" in app.scene["hint"]
 
 
+def test_region_selection_uses_overlay_start_and_finishes(monkeypatch):
+    """Windows 轮询提供的起点应生成正确区域并退出框选模式。"""
+    app = App.__new__(App)
+    app.cfg = config.Config()
+    app.region = None
+    app.mode = "region"
+    app.scene = {}
+    app._region_start = None
+    app.overlay = type("OverlayRef", (), {"_region_start": (100, 120)})()
+    app._set_click_through = lambda _on: None
+    app._reset_tracking = lambda: None
+    app._redetect = lambda: None
+    monkeypatch.setattr(app.cfg, "save", lambda: None)
+
+    app.on_drag_end(700, 620)
+
+    assert app.region == [100, 120, 600, 500]
+    assert app.cfg.capture_region == [100, 120, 600, 500]
+    assert app.mode == "auto"
+    assert app._region_start is None
+
+
 def test_analyze_hides_aim_until_ball_positions_settle():
     """跨帧确认期间只能显示球位，READY 后才允许输出瞄准线。"""
     img, _ = synth.random_layout(seed=12)

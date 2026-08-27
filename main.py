@@ -1169,14 +1169,16 @@ class App:
         elif keysym == "r":
             # 重新框选必须脱离旧捕获区域，否则旧区域越界/错位时，
             # 新框选完成后仍可能继续截取错误位置。R 模式始终从全屏开始。
-            if self.region is not None:
-                self.region = None
-                self.cfg.capture_region = None
+            old_region = self.region or self.cfg.capture_region
+            self.region = None
+            self.cfg.capture_region = None
+            print(f"[框选] 进入全屏选择，清除旧区域: {old_region}", flush=True)
+            if old_region is not None:
                 self._reset_tracking()
-                try:
-                    self.cfg.save()
-                except OSError as exc:
-                    print(f"[框选] 无法保存全屏捕获状态: {exc}", flush=True)
+            try:
+                self.cfg.save()
+            except OSError as exc:
+                print(f"[框选] 无法保存全屏捕获状态: {exc}", flush=True)
             self.mode = "region"
             self._set_click_through(False)
             if self.overlay:
@@ -1306,19 +1308,33 @@ class App:
                         y1 = max(0, min(y1, sh))
                 except (AttributeError, OSError, TypeError, ValueError):
                     pass
-            if x1 - x0 > 40 and y1 - y0 > 40:
-                self.region = [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
-                self.cfg.capture_region = self.region
-                self.cfg.save()
-                # 区域变了=坐标系变了，旧跟踪/单应阵全部作废
-                self._reset_tracking()
-                self.scene["hint"] = f"捕获区域已设为 {self.region}（已保存）"
-            else:
-                self.scene["hint"] = "区域太小，未修改"
-            self.mode = "auto"
-            self._region_start = None
-            self._set_click_through(True)
-            self._redetect()
+            try:
+                if x1 - x0 > 40 and y1 - y0 > 40:
+                    self.region = [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
+                    self.cfg.capture_region = self.region
+                    # 区域变了=坐标系变了，旧跟踪/单应阵全部作废
+                    self._reset_tracking()
+                    try:
+                        self.cfg.save()
+                    except OSError as exc:
+                        # 保存失败不应让本次框选卡在 region 模式；当前进程
+                        # 仍可使用刚选的区域，下次启动会回到全屏并提示重选。
+                        print(f"[框选] 区域已应用但保存失败: {exc}", flush=True)
+                        self.scene["hint"] = f"捕获区域已设为 {self.region}（本次有效，保存失败）"
+                    else:
+                        self.scene["hint"] = f"捕获区域已设为 {self.region}（已保存）"
+                    print(f"[框选] 完成: start=({sx},{sy}) end=({x},{y}) "
+                          f"region={self.region}", flush=True)
+                else:
+                    self.scene["hint"] = "区域太小，未修改"
+                    print(f"[框选] 忽略过小区域: start=({sx},{sy}) end=({x},{y})",
+                          flush=True)
+            finally:
+                # 无论配置文件是否可写，都必须结束当前一次选择并恢复自动模式。
+                self.mode = "auto"
+                self._region_start = None
+                self._set_click_through(True)
+                self._redetect()
 
     def quit(self) -> None:
         self.running = False

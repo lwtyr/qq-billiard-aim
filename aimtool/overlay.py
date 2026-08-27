@@ -252,11 +252,14 @@ class Overlay:
                     self._region_dragging = True
                     self._region_start = (x, y)
                     self._region_current = (x, y)
+                    print(f"[框选] 鼠标按下: ({x},{y})", flush=True)
                 elif lbtn and self._region_dragging:
                     self._region_current = (x, y)
                 elif not lbtn and self._region_dragging:
                     self._region_dragging = False
                     self._region_active = False
+                    print(f"[框选] 鼠标释放: start={self._region_start} "
+                          f"end=({x},{y})", flush=True)
                     try:
                         self.on_drag_end(x, y)
                     except Exception as e:
