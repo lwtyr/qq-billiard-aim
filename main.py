@@ -116,7 +116,7 @@ except ModuleNotFoundError as exc:
         "请在项目目录运行: python -m pip install -r requirements.txt"
     )
 
-APP_VERSION = "3.7.0"
+APP_VERSION = "3.7.1"
 
 HELP_TEXT = ("1-6 选袋口 | 0 自动 | G 点选目标球 | M 手动录入 | R 框选区域 | K 库边解围 | "
              "Q 下一杆打彩球 | O 兼容键 | P 自动袋口 | B 球标注 | X 穿透 | T 隐藏 | C 重识别 | Esc 退出")

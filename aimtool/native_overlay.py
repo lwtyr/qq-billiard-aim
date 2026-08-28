@@ -289,15 +289,17 @@ class NativeLayer:
             # 「自己画的内容被识别管线当成遮挡/异色块」。
             self.drawn_mask = (self._bits[:, :, 3] > 0).astype(np.uint8)
             self._push()
+            self._last_push = now
             # 置顶保活：QQ 游戏窗口同为 TOPMOST，被激活后会排到本层之上
-            # （bug4：选框被球桌盖住）。每约 1 秒重申一次 TOPMOST 拉回 Z 序顶端。
+            # （bug4/bug5：选框被球桌盖住）。每约 1 秒重申一次 TOPMOST。
+            # 注意：必须在 _last_push 更新之后执行，且用 self._wintypes
+            # （本模块 wintypes 是 __init__ 局部导入，模块级不存在）。
             tick = getattr(self, "_topmost_tick", 0) + 1
             self._topmost_tick = tick
             if tick % _TOPMOST_REFRESH_FRAMES == 0:
                 self._u32.SetWindowPos(
-                    self._hwnd, wintypes.HWND(_HWND_TOPMOST), 0, 0, 0, 0,
+                    self._hwnd, self._wintypes.HWND(_HWND_TOPMOST), 0, 0, 0, 0,
                     _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE)
-            self._last_push = now
         except Exception as exc:
             print(f"[overlay] 直绘异常: {type(exc).__name__}: {exc}", flush=True)
 
