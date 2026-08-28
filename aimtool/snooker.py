@@ -271,21 +271,6 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
             if opening_break_target(balls, cue, r) is not None:
                 return None, "red", "红球阶段：开局球架"
 
-            # 实战兜底：全场红球均无全通畅线路时，选出切角最小/离袋最近的最佳红球，保证红球阶段绝不落空
-            cand_fallbacks = []
-            for tb in reds:
-                for p in pockets:
-                    s = physics.direct_shot(cue.pos, tb.pos, p, r, _others(balls, cue, tb),
-                                            cue_radius=float(getattr(cue, "radius", r) or r),
-                                            target_radius=float(getattr(tb, "radius", r) or r))
-                    if s.valid and physics.pocket_entry_ok(s, w, h, r):
-                        cand_fallbacks.append((s.cut_deg, s.target_to_pocket, tb))
-            if cand_fallbacks:
-                cand_fallbacks.sort(key=lambda x: (x[0], x[1]))
-                best_tb = cand_fallbacks[0][2]
-                n = reds_remaining(balls)
-                return best_tb, "red", f"红球阶段（剩 {n} 颗红球·推荐较优红球）：打红球"
-
             return None, "red", "红球阶段：所有红球暂无可行方案"
     if selected_on == "color":
         # 红球仍在时，红后彩球是任选目标；按自动选球优先级在所有
@@ -329,20 +314,6 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
                     best = (key, tb)
         if best is not None:
             return best[1], "color", f"红后任选彩球：打{best[1].label}"
-
-        # 实战兜底：彩球无全通畅线路时，选出切角最小/离袋最近的最佳彩球
-        cand_fallbacks = []
-        for tb in colors:
-            for p in pockets:
-                s = physics.direct_shot(cue.pos, tb.pos, p, r, _others(balls, cue, tb),
-                                        cue_radius=float(getattr(cue, "radius", r) or r),
-                                        target_radius=float(getattr(tb, "radius", r) or r))
-                if s.valid and physics.pocket_entry_ok(s, w, h, r):
-                    cand_fallbacks.append((s.cut_deg, s.target_to_pocket, tb))
-        if cand_fallbacks:
-            cand_fallbacks.sort(key=lambda x: (x[0], x[1]))
-            best_tb = cand_fallbacks[0][2]
-            return best_tb, "color", f"红后任选彩球（推荐较优彩球）：打{best_tb.label}"
 
         return None, "color", "红后任选彩球：所有彩球暂无可行方案"
 

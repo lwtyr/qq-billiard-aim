@@ -1074,22 +1074,9 @@ def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
             ]
 
     if shot is None:
-        # 降级兜底方案：绝不在实战中直接报「无可行方案」清空瞄准线！
-        # 遍历 6 个袋口，选出切角最小、进袋几何最佳的直球方案展示（即使有阻挡）
-        fallback_shots = []
-        for p in pockets_t:
-            s = physics.direct_shot(cue_t, target_t, p, r, others,
-                                    cue_radius=cue_radius, target_radius=target_radius,
-                                    ghost_offset=ghost_offset)
-            if s.valid and physics.pocket_entry_ok(s, W, H, r):
-                fallback_shots.append(s)
-        if fallback_shots:
-            shot = min(fallback_shots, key=lambda s: (s.cut_deg, s.total))
-            scene["hint"] = "进球路线有阻挡或角度刁钻，仍提供几何瞄准参考"
-        else:
-            scene["status"] = "无可行方案"
-            scene["hint"] = "该球暂无直球/解围路线，试试换目标球或袋口"
-            return scene
+        scene["status"] = "无可行方案"
+        scene["hint"] = "该球暂无直球/解围路线，试试换目标球或袋口"
+        return scene
 
     # 推荐力度（切角补偿 + 库边能量损耗补偿）
     power = physics.power_suggestion(shot.total, W, cfg.power_dref_ratio,
