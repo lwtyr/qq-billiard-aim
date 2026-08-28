@@ -1053,6 +1053,10 @@ def _split_blobs(mask: np.ndarray, color: np.ndarray, r: float,
         dil = cv2.dilate(dist, np.ones((3, 3), np.uint8))
         peaks = ((dist >= dil) & (dist > 0.4 * r)).astype(np.uint8)
         if peaks.sum() < 2:
+            # 关键修复：轮廓圆度过低（例如游戏自带细长瞄准红线、球杆反光），
+            # 绝不能把非球线段的质心误当作一颗球！真球圆度通常 >= 0.55，细长红线 circ < 0.15。
+            if circ < 0.38:
+                continue
             m = cv2.moments(c)
             if m["m00"] > 1e-6:
                 out.append((float(m["m10"] / m["m00"]), float(m["m01"] / m["m00"])))
@@ -1677,8 +1681,8 @@ class TableTracker:
             self.miss += 1
             self._jump = 0
             self._jump_samples = []
-            if self.miss >= self.cfg.table_max_miss:
-                self.quad = None          # 解锁，强制重新检测
+            # 关键修复：一旦台面首帧锁定，不能因球杆横跨边带或短暂遮挡就丢弃锁定框；
+            # 丢弃会导致叠加层白框短暂消失又重新出现。保持历史有效框，除非按 C 重识别。
             return self.quad
         self.miss = 0
         if self.quad is None:
