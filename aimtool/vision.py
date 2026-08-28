@@ -642,14 +642,27 @@ def detect_table_occlusion(warped: np.ndarray, cfg, r: float,
         fill = area / max(1.0, float(bw * bh))
         if fill < 0.18:
             continue
+        # 细长条（任意角度）不是面板：球杆/杆影/力度条斜跨台面时，
+        # 轴对齐 bbox 又宽又高（躲过短边检查），fill 也可能略超阈值。
+        # 用最小外接旋转矩形：真面板两个主方向都宽；细长条短边只有
+        # 杆宽量级，长短比远大于面板。实测斜跨球杆 fill≈0.19-0.24。
+        ys_, xs_ = np.nonzero(lab == idx)
+        pts = np.column_stack((xs_, ys_)).astype(np.float32)
+        (rw, rh) = cv2.minAreaRect(pts)[1]
+        short_side, long_side = min(rw, rh), max(rw, rh)
+        if short_side < 3.0 * r or long_side > 2.5 * max(short_side, 1e-6):
+            continue
         # 纯暗大块是球群阴影/袋口/黑球，不是界面；真菜单是白/灰亮面板。
         comp_px = warped[lab == idx]
         if float(comp_px.max(axis=1).mean()) < 60.0:
             continue
+        mask = np.zeros(foreign.shape, np.uint8)
+        mask[ys_, xs_] = 255
         return {
             "area": area,
             "bbox": (bx, by, bw, bh),
             "fill": fill,
+            "mask": mask,
         }
     return None
 

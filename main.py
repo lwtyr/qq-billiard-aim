@@ -116,7 +116,7 @@ except ModuleNotFoundError as exc:
         "请在项目目录运行: python -m pip install -r requirements.txt"
     )
 
-APP_VERSION = "3.7.1"
+APP_VERSION = "3.7.2"
 
 HELP_TEXT = ("1-6 选袋口 | 0 自动 | G 点选目标球 | M 手动录入 | R 框选区域 | K 库边解围 | "
              "Q 下一杆打彩球 | O 兼容键 | P 自动袋口 | B 球标注 | X 穿透 | T 隐藏 | C 重识别 | Esc 退出")
@@ -319,6 +319,31 @@ def _warn_once(msg: str, frame: Optional[np.ndarray] = None,
                 print(f"[识别异常] 原始帧已存至 {path}", flush=True)
 
 
+def _bbox_iou(a, b) -> float:
+    """两个 (x, y, w, h) 轴对齐框的交并比，用于判断遮挡块是否同位。"""
+    ax0, ay0, aw, ah = a
+    bx0, by0, bw, bh = b
+    iw = max(0, min(ax0 + aw, bx0 + bw) - max(ax0, bx0))
+    ih = max(0, min(ay0 + ah, by0 + bh) - max(ay0, by0))
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _occ_streak_hit(state: Dict, bbox) -> int:
+    """遮挡连续命中计数：同位置（IoU>0.6）累加，换位重置为 1。
+
+    state 是跨帧持久的 dict（{"bbox", "n", "static"}），原地更新。
+    """
+    prev = state.get("bbox")
+    if prev is not None and _bbox_iou(prev, bbox) > 0.6:
+        state["n"] = int(state.get("n", 0)) + 1
+    else:
+        state["bbox"] = tuple(bbox)
+        state["n"] = 1
+    return state["n"]
+
+
 def _ema_point(state: Dict, key: str, cur: physics.Point,
                jump: float, alpha: float = 0.5) -> physics.Point:
     """带跳变保护的逐帧 EMA。球被切换/窗口移动时直接跟随，避免把真位移糊掉。"""
@@ -430,6 +455,7 @@ class _AnalysisContext:
     ghost_offset: tuple = (0.0, 0.0)
     break_mode: bool = False
     rule_text: str = ""
+    occ_streak: Dict = field(default_factory=dict)  # 遮挡 streak+常驻 UI 学习（跨帧引用）
 
 
 def _stage_find_table(ctx: _AnalysisContext) -> Optional[Dict]:
@@ -568,11 +594,24 @@ def _stage_balls(ctx: _AnalysisContext) -> Optional[Dict]:
     smooth = ctx.smooth
     # QQ 菜单/设置窗口/提示弹窗会把大块白灰面板送进白球掩膜，
     # 造成大量假球。污染帧必须暂停瞄准，不能沿用上一帧方案继续显示。
-    # 不再把任何一帧的外来像素立即“学习”为静态背景：旧实现会把真菜单
-    # 在下一帧放行。大面板暂停，小型连击文字由 ui_mask 从球检测中排除。
+    # 但游戏自带常驻 UI（力度条/按钮区）也在台面 warp 坐标里每帧
+    # 固定出现，若一律早退会变成「大多数时候没有辅助线」（bug6）。
+    # 区分策略：同位置连续命中 >=3 帧才判定为常驻 UI，学习为静态
+    # 区域后放行（transient_ui_mask 仍会把该区域从球检测排除，球
+    # 不会误检）；偶发弹窗（前两帧）维持暂停保护。
     occlusion = vision.detect_table_occlusion(
         warped, cfg, r_analysis, hsv=warped_hsv, foreign=foreign_mask,
-        felt_hsv=felt_hsv)
+        felt_hsv=felt_hsv, static_mask=ctx.occ_streak.get("static"))
+    if occlusion is not None:
+        if _occ_streak_hit(ctx.occ_streak, occlusion["bbox"]) >= 3:
+            m = occlusion.get("mask")
+            if m is not None and m.shape == warped.shape[:2]:
+                prev = ctx.occ_streak.get("static")
+                ctx.occ_streak["static"] = (
+                    m if prev is None else
+                    (((prev > 0) | (m > 0)).astype(np.uint8) * 255))
+            ctx.occ_streak.update({"bbox": None, "n": 0})
+            occlusion = None   # 学习完成，本帧继续正常识别
     if occlusion is not None:
         # 诊断日志：真实遮挡 vs 球杆/反光误报，把触发块的特征记下来
         _warn_once(f"[遮挡] 检测到遮挡: {occlusion}", frame, key="occlusion")
@@ -1105,7 +1144,8 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
             ball_tracker: Optional[tracking.BallTracker] = None,
             table_state: Optional[tracking.TableStateTracker] = None,
             turn_tracker: Optional[snooker.TurnTracker] = None,
-            captured_at: Optional[float] = None) -> Dict:
+            captured_at: Optional[float] = None,
+            occ_state: Optional[Dict] = None) -> Dict:
     """一帧 → 场景描述（屏幕坐标，供 Overlay 直接绘制）。"""
     started_at = time.perf_counter()
 
@@ -1120,7 +1160,8 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
         tracker=tracker, prefer_target=prefer_target,
         pocket_tracker=pocket_tracker, smooth=smooth, self_mask=self_mask,
         ball_tracker=ball_tracker, table_state=table_state,
-        turn_tracker=turn_tracker, captured_at=captured_at)
+        turn_tracker=turn_tracker, captured_at=captured_at,
+        occ_streak=occ_state if occ_state is not None else {})
     ctx.W, ctx.H = cfg.table_w, cfg.table_h
     ctx.captured_at = time.monotonic() if captured_at is None else captured_at
     for _stage in (_stage_find_table, _stage_pockets, _stage_balls,
@@ -1158,6 +1199,9 @@ class App:
         self.overlay = None
         self.tracker = vision.TableTracker(cfg) if cfg.table_lock else None
         self.pocket_tracker = vision.PocketTracker(cfg)
+        # 遮挡 streak 与常驻 UI 学习（跨帧引用，传入 analyze；bug6：
+        # 游戏自带力度条/按钮区每帧触发遮挡早退 → 大多数时候没辅助线）
+        self._occ_state: Dict = {"static": None, "bbox": None, "n": 0}
         self.ball_tracker = tracking.BallTracker(cfg)
         self.table_state = tracking.TableStateTracker(cfg)
         self.turn_tracker = snooker.TurnTracker()
@@ -1290,6 +1334,7 @@ class App:
                             table_state=self.table_state,
                             turn_tracker=self.turn_tracker,
                             captured_at=packet.captured_at,
+                            occ_state=self._occ_state,
                         )
                         # 捕获区域模式：识别输出的是区域局部坐标，而 Overlay
                         # 全屏窗口从 (0,0) 画起——不补偿 region 原点会让所有
@@ -1569,6 +1614,8 @@ class App:
     def _redetect(self) -> None:
         # 让下一张已捕获帧立即重跑；不再依赖旧版检测循环计数器。
         self._last_packet_sequence = -1
+        # 重新框选后台面内容变了，旧学习的常驻 UI 区域不再可信。
+        self._occ_state.update({"static": None, "bbox": None, "n": 0})
 
     def on_click(self, x: int, y: int) -> None:
         if self.mode == "region":
