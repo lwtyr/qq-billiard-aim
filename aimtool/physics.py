@@ -226,10 +226,35 @@ MAX_CUT_DEG = 85.0
 
 def _path_blocked(segments: Sequence[Tuple[Point, Point]],
                   others: Sequence[Point], r: float, tolerance: float = 1.0) -> Tuple[bool, Optional[str]]:
-    """判断路径各段是否被 other 球阻挡（球心距线段 < 2r 视为挡）。"""
+    """判断路径各段是否被 other 球阻挡。
+
+    严格约束：绿线（cue→ghost）与黄虚线（target→pocket）前进路径上绝不允许有任何碰撞球。
+    使用扫掠球（Swept-Sphere Capsule）进行精确碰撞判定：
+    - 位于球体前进路径前方且侧向间距 < 2r 的球严密判定为阻挡；
+    - 位于起点球体后方（已背向运动）的相切球不产生虚假阻挡。
+    """
+    r_coll = 2.0 * r * tolerance
+    r_coll2 = r_coll * r_coll
     for o in others:
         for a, b in segments:
-            if seg_point_dist(o, a, b) < 2.0 * r * tolerance:
+            vx = b[0] - a[0]
+            vy = b[1] - a[1]
+            L = math.hypot(vx, vy)
+            if L < 1e-9:
+                continue
+            ux = vx / L
+            uy = vy / L
+            wx = o[0] - a[0]
+            wy = o[1] - a[1]
+            s = wx * ux + wy * uy
+            d_perp2 = (wx * wx + wy * wy) - (s * s)
+            if d_perp2 >= r_coll2:
+                continue
+            half_chord = math.sqrt(max(0.0, r_coll2 - d_perp2))
+            t_enter = s - half_chord
+            t_exit = s + half_chord
+            # 碰撞区间 [t_enter, t_exit] 必须在运动前进区间 [0, L] 内发生
+            if t_enter < L and t_exit > 0.05 * r_coll and s > -0.2 * r_coll:
                 return True, f"({o[0]:.0f},{o[1]:.0f})"
     return False, None
 
