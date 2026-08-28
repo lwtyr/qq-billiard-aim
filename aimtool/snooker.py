@@ -39,6 +39,17 @@ class TurnTracker:
     # the override is released when the visible ball counts actually change.
     _manual_ball_on: Optional[str] = None
     _manual_counts: Optional[Tuple[int, int]] = None
+    # 击杆周期感知：台面从稳定进入非稳定（球在动）即一杆开始，恢复稳
+    # 定时若球数与杆前相同＝这杆没进球。视觉无法区分「还没打」与「打
+    # 了没进」，但 MOVING→READY 周期本身就是「打过一杆」的证据，必须
+    # 据此推进状态，否则红后彩球没进会永远停在「任选彩球」（跳过黄
+    # 球直接磁切角好的绿球）。
+    _pending_shot: bool = False
+    _pre_shot_counts: Optional[Tuple[int, int]] = None
+    # 红球数识别偶发 ±1 抖动（球架遮挡）：单帧减少不确认，连续两个稳
+    # 定帧仍少才切换到红后彩球；确认前不同步基线，避免基线被低值污
+    # 染后真进球再也触发不了。
+    _red_drop: int = 0
 
     def reset(self) -> None:
         self.ball_on = None
@@ -46,12 +57,34 @@ class TurnTracker:
         self._colors = None
         self._manual_ball_on = None
         self._manual_counts = None
+        self._pending_shot = False
+        self._pre_shot_counts = None
+        self._red_drop = 0
 
     def update(self, balls: Sequence, stable: bool) -> str:
         reds = reds_remaining(balls)
         colors = sum(1 for b in balls if b.label in COLOR_ORDER)
         if not stable:
+            if self._reds is not None and not self._pending_shot:
+                self._pre_shot_counts = (self._reds, self._colors or 0)
+            self._pending_shot = True
             return self.ball_on or ("clear" if reds == 0 else "red")
+
+        counts = (reds, colors)
+        if self._pending_shot:
+            # 一杆结束（MOVING/STABILIZING → READY）。球数与杆前相同＝
+            # 这一杆没进球：
+            #   * 红后任选彩球没进 → 红球还在则换手打红；红球已清则
+            #     进入严格清彩顺序；
+            #   * 红球/清彩阶段没进 → 本来就继续打同类，无需变化。
+            # Q 手动覆盖期间不推进（用户明确指定的状态优先）。
+            self._pending_shot = False
+            if (self._pre_shot_counts is not None
+                    and counts == self._pre_shot_counts
+                    and self._manual_ball_on is None
+                    and self.ball_on == "color"):
+                self.ball_on = "red" if reds > 0 else "clear"
+            self._pre_shot_counts = None
 
         if self._manual_ball_on is not None:
             counts = (reds, colors)
@@ -85,8 +118,14 @@ class TurnTracker:
         elif reds < self._reds:
             # 红球数减少（包括最后一颗红球）后，下一杆都必须先选彩球。
             # 不能在 reds==0 时直接进入 clear，否则会跳过最后一颗红后的
-            # 任选彩球阶段。
-            self.ball_on = "color"
+            # 任选彩球阶段。单帧减少不算：连续两个稳定帧仍少才确认，
+            # 确认前不同步基线，防止遮挡抖动把基线拉低后真进球失灵。
+            if self._red_drop + 1 >= 2:
+                self.ball_on = "color"
+                self._red_drop = 0
+            else:
+                self._red_drop += 1
+                return self.ball_on or "red"
         elif self.ball_on == "color" and colors < (self._colors or 0):
             # 颜色在进红后的当前杆被打掉（短暂未复位的画面）。
             self.ball_on = "red" if reds > 0 else "clear"
@@ -95,6 +134,7 @@ class TurnTracker:
         elif self.ball_on is None:
             self.ball_on = "red"
         self._reds, self._colors = reds, colors
+        self._red_drop = 0
         return self.ball_on or "red"
 
     def cycle_manual(self, balls: Sequence) -> str:

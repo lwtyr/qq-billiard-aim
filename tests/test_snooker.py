@@ -212,7 +212,9 @@ def test_turn_tracker_q_toggle_survives_next_visual_update():
     assert tracker.toggle_red_color(balls) == "color"
     assert tracker.update(balls, stable=True) == "color"
     assert tracker.toggle_red_color(balls) == "red"
-    # 最后一颗红球消失后，下一杆仍是红后任选彩球。
+    # 最后一颗红球消失后，下一杆仍是红后任选彩球。红球数减少需连续
+    # 两个稳定帧确认（防识别抖动），首帧保持原状态。
+    assert tracker.update([cue, black], stable=True) == "red"
     assert tracker.update([cue, black], stable=True) == "color"
 
 
@@ -323,6 +325,8 @@ def test_turn_tracker_enters_color_after_last_red():
     black = vision.Ball("黑球", (1500.0, 500.0), r)
 
     assert t.update([cue, *reds, black], stable=True) == "red"
+    # 红球减少需连续两个稳定帧确认（防识别抖动）
+    assert t.update([cue, reds[0], black], stable=True) == "red"
     assert t.update([cue, reds[0], black], stable=True) == "color"
     assert t.update([cue, black], stable=True) == "color"
 
