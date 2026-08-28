@@ -317,25 +317,25 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
 
         return None, "color", "红后任选彩球：所有彩球暂无可行方案"
 
-    # 清彩阶段必须严格按分值顺序：优先只考虑「下一颗该打的彩球」。
+    # 清彩阶段必须严格按分值顺序：绝不允许跳过低分球打高分球（实战犯规送分）。
     tb = next_color(balls)
     if tb is None:
         return None, "color", "清彩阶段：场上无彩球"
+    v = COLOR_VALUE[tb.label]
     plans = _plan(cue, tb, pockets, r, w, h,
                   _others(balls, cue, tb), cfg)
-    v = COLOR_VALUE[tb.label]
     if best_target_shot(plans) is not None:
         return tb, "color", f"清彩阶段：打{tb.label}（{v} 分）"
-    # 当前该打的彩球没有任何线路：与其整局膣死报「无可行方案」，
-    # 不如按分值顺序降级到第一颗有线路的彩球并明确提示。
-    # 优先级不变：低分球一旦有线路永远优先。
-    alts = sorted((b for b in balls if b.label in COLOR_ORDER
-                   and COLOR_VALUE[b.label] > v),
-                  key=lambda b: COLOR_VALUE[b.label])
-    for alt in alts:
-        p2 = _plan(cue, alt, pockets, r, w, h,
-                   _others(balls, cue, alt), cfg)
-        if best_target_shot(p2) is not None:
-            return alt, "color", (f"清彩阶段：{tb.label}（{v} 分）暂无线路，"
-                                  f"降级打{alt.label}（{COLOR_VALUE[alt.label]} 分）")
-    return None, "color", f"清彩阶段：{tb.label}（{v} 分）暂无可行方案（被挡或切角过大）"
+
+    # 若直球没有通畅线路，尝试库边解围
+    if not cfg.allow_kicks:
+        import copy
+        cfg_kicks = copy.copy(cfg)
+        cfg_kicks.allow_kicks = True
+        p_kicks = _plan(cue, tb, pockets, r, w, h,
+                        _others(balls, cue, tb), cfg_kicks)
+        if best_target_shot(p_kicks) is not None:
+            return tb, "color", f"清彩阶段：打{tb.label}（{v} 分·库边解围）"
+
+    # 目标球仍严格锁定为下一颗法定彩球（绝不跳顺序瞄准高分球）
+    return tb, "color", f"清彩阶段：{tb.label}（{v} 分）暂无安全进袋线路，建议做球/防守"

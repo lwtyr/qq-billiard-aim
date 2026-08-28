@@ -84,16 +84,16 @@ def _cage_balls():
     return out
 
 
-def test_clearance_downgrades_when_lowest_ball_caged():
+def test_clearance_strictly_keeps_lowest_ball_even_when_caged():
+    """清彩阶段绝不跳顺序打高分球（实战犯规送分）：黄球被围仍严格锁定黄球。"""
     from aimtool import config, snooker
     balls = _cage_balls()
     cfg = config.Config()
     target, phase, rule = snooker.choose_target(
         balls, balls[0], physics.default_pockets(2540.0, 1270.0),
         52.0, 2540.0, 1270.0, cfg, ball_on="clear")
-    assert target is not None, f"降级兜底失效：{rule}"
-    assert target.label == "绿球"
-    assert "降级" in rule and "黄球" in rule
+    assert target is not None and target.label == "黄球"
+    assert "黄球" in rule
 
 
 def test_clearance_strict_order_still_first():
