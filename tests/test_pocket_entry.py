@@ -64,3 +64,48 @@ def test_plan_shots_filters_mid_pocket():
     assert plans, "右上角袋直球路线应保留"
     assert all(s.pocket != pocket_mid for s in plans), \
         "上中袋大斜角路线必须被过滤"
+
+
+# ---------- 清彩降级兜底（黄球无线路时不再整局躺死） ----------
+
+def _cage_balls():
+    """黄球被 8 颗球围死在台面中央（任何出线都被挡），绿球空旷可打。"""
+    import math
+    from aimtool import vision
+    cx, cy = 1270.0, 635.0
+    cage = 2.3 * 52.0
+    out = [vision.Ball("白球", (400.0, 300.0), 52.0)]
+    for i in range(8):
+        a = i * math.pi / 4
+        out.append(vision.Ball("红球", (cx + cage * math.cos(a),
+                                        cy + cage * math.sin(a)), 52.0))
+    out.append(vision.Ball("黄球", (cx, cy), 52.0))
+    out.append(vision.Ball("绿球", (2000.0, 1000.0), 52.0))
+    return out
+
+
+def test_clearance_downgrades_when_lowest_ball_caged():
+    from aimtool import config, snooker
+    balls = _cage_balls()
+    cfg = config.Config()
+    target, phase, rule = snooker.choose_target(
+        balls, balls[0], physics.default_pockets(2540.0, 1270.0),
+        52.0, 2540.0, 1270.0, cfg, ball_on="clear")
+    assert target is not None, f"降级兜底失效：{rule}"
+    assert target.label == "绿球"
+    assert "降级" in rule and "黄球" in rule
+
+
+def test_clearance_strict_order_still_first():
+    """黄球有线路时仍然严格优先打黄球（降级只在无线路时发生）。"""
+    from aimtool import config, snooker
+    from aimtool import vision
+    balls = [vision.Ball("白球", (400.0, 300.0), 52.0),
+             vision.Ball("黄球", (800.0, 400.0), 52.0),
+             vision.Ball("绿球", (2000.0, 1000.0), 52.0)]
+    cfg = config.Config()
+    target, phase, rule = snooker.choose_target(
+        balls, balls[0], physics.default_pockets(2540.0, 1270.0),
+        52.0, 2540.0, 1270.0, cfg, ball_on="clear")
+    assert target is not None and target.label == "黄球"
+    assert "降级" not in rule

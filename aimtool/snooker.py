@@ -86,6 +86,16 @@ class TurnTracker:
                 self.ball_on = "red" if reds > 0 else "clear"
             self._pre_shot_counts = None
 
+        # 新局检测：清彩阶段台面不应有红球；红后任选阶段红球一杆最多
+        # 少 1-2 颗、绝不会大增。红球重新出现/大增必然是「新开一把」，
+        # 旧状态全部作废回到红球阶段 —— 否则残留的 clear 会让清彩
+        # 分支只盯黄球，黄球被彩球堆挡住时报全程无可行方案。
+        if (self._manual_ball_on is None
+                and self._reds is not None
+                and ((self.ball_on == "clear" and reds > 0)
+                     or (self.ball_on == "color" and reds - self._reds >= 3))):
+            self.ball_on = "red"
+
         if self._manual_ball_on is not None:
             counts = (reds, colors)
             if reds == 0:
@@ -359,8 +369,7 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
             return best[1], "color", f"红后任选彩球：打{best[1].label}"
         return None, "color", "红后任选彩球：所有彩球暂无可行方案"
 
-    # 清彩阶段必须严格按分值顺序：只考虑「下一颗该打的彩球」。
-    # 原实现会跳过无方案的黄球直接打绿球——实战中这是犯规送分。
+    # 清彩阶段必须严格按分值顺序：优先只考虑「下一颗该打的彩球」。
     tb = next_color(balls)
     if tb is None:
         return None, "color", "清彩阶段：场上无彩球"
@@ -369,4 +378,16 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
     v = COLOR_VALUE[tb.label]
     if best_target_shot(plans) is not None:
         return tb, "color", f"清彩阶段：打{tb.label}（{v} 分）"
+    # 当前该打的彩球没有任何线路：与其整局膣死报「无可行方案」，
+    # 不如按分值顺序降级到第一颗有线路的彩球并明确提示。
+    # 优先级不变：低分球一旦有线路永远优先。
+    alts = sorted((b for b in balls if b.label in COLOR_ORDER
+                   and COLOR_VALUE[b.label] > v),
+                  key=lambda b: COLOR_VALUE[b.label])
+    for alt in alts:
+        p2 = _plan(cue, alt, pockets, r, w, h,
+                   _others(balls, cue, alt), cfg)
+        if best_target_shot(p2) is not None:
+            return alt, "color", (f"清彩阶段：{tb.label}（{v} 分）暂无线路，"
+                                  f"降级打{alt.label}（{COLOR_VALUE[alt.label]} 分）")
     return None, "color", f"清彩阶段：{tb.label}（{v} 分）暂无可行方案（被挡或切角过大）"

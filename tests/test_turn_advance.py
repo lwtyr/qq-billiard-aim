@@ -77,3 +77,37 @@ def test_miss_advance_skipped_during_manual_override():
     assert t.toggle_red_color(balls) == "color"
     assert t.update(balls, stable=False) == "color"
     assert t.update(balls, stable=True) == "color"   # 没进，仍保持 Q 指定
+
+
+# ---------- 新局检测（v3.6.3 回归：上一把残留 clear → 新一把全程无可行方案） ----------
+
+def test_new_frame_after_clear_restores_red():
+    """上一把打完停在 clear，新一把红球重现 → 立即回红球阶段。"""
+    t = snooker.TurnTracker()
+    # 上一把：清彩阶段（只剩黑球）
+    assert t.update(_balls(reds=0, colors=("黑球",)), stable=True) == "clear"
+    # 新开一把：红球满桌（红球从 0 → 15，clear 阶段不该有红球）
+    assert t.update(_balls(reds=15, colors=("黄球", "绿球", "棕球",
+                                            "蓝球", "粉球", "黑球")),
+                    stable=True) == "red"
+
+
+def test_new_frame_color_state_red_surge_restores_red():
+    """任选彩球阶段红球大增（一杆最多少 1-2 颗）→ 新一把，回红球阶段。"""
+    t = snooker.TurnTracker()
+    assert t.update(_balls(reds=2, colors=("黑球",)), stable=True) == "red"
+    assert t.update(_balls(reds=1, colors=("黑球",)), stable=True) == "red"
+    assert t.update(_balls(reds=1, colors=("黑球",)), stable=True) == "color"
+    # 新一把：红球 1 → 15（+14 ≥ 3）
+    assert t.update(_balls(reds=15, colors=("黄球", "绿球", "棕球",
+                                            "蓝球", "粉球", "黑球")),
+                    stable=True) == "red"
+
+
+def test_manual_override_survives_new_frame_detection():
+    """Q 手动覆盖期间不做新局推进（用户指定优先）。"""
+    t = snooker.TurnTracker()
+    assert t.update(_balls(reds=5, colors=("黑球",)), stable=True) == "red"
+    t.cycle_manual(_balls(reds=5, colors=("黑球",)))  # 切到红后任选彩球
+    # 新一把：红球 5 → 15（+10），但手动覆盖优先，不推进
+    assert t.update(_balls(reds=15, colors=("黄球",)), stable=True) == "color"
