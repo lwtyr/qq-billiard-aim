@@ -116,7 +116,7 @@ except ModuleNotFoundError as exc:
         "请在项目目录运行: python -m pip install -r requirements.txt"
     )
 
-APP_VERSION = "3.7.2"
+APP_VERSION = "3.7.3"
 
 HELP_TEXT = ("1-6 选袋口 | 0 自动 | G 点选目标球 | M 手动录入 | R 框选区域 | K 库边解围 | "
              "Q 下一杆打彩球 | O 兼容键 | P 自动袋口 | B 球标注 | X 穿透 | T 隐藏 | C 重识别 | Esc 退出")
@@ -328,6 +328,26 @@ def _bbox_iou(a, b) -> float:
     inter = iw * ih
     union = aw * ah + bw * bh - inter
     return inter / union if union > 0 else 0.0
+
+
+def _clip_ray_end(p0, p1, w: float, h: float):
+    """把射线端点 p1 裁剪到台面矩形 [0,w]x[0,h] 内（p0 须在台内）。
+
+    用于白球切线等示意线段：过长伸出桌外会误导击球点。
+    返回新端点（保持方向，缩短长度）；p0/p1 都在台内时原样返回。
+    """
+    x0, y0 = p0
+    dx, dy = p1[0] - x0, p1[1] - y0
+    t = 1.0
+    if dx < 0:
+        t = min(t, x0 / -dx)
+    elif dx > 0:
+        t = min(t, (w - x0) / dx)
+    if dy < 0:
+        t = min(t, y0 / -dy)
+    elif dy > 0:
+        t = min(t, (h - y0) / dy)
+    return (x0 + dx * t, y0 + dy * t)
 
 
 def _occ_streak_hit(state: Dict, bbox) -> int:
@@ -646,6 +666,9 @@ def _stage_balls(ctx: _AnalysisContext) -> Optional[Dict]:
     balls_analysis = vision.detect_balls(
         warped, r_analysis, cfg=cfg, pockets=pockets_analysis, clean=clean,
         warped_hsv=warped_hsv, warped_gray=warped_gray,
+        # 已学习的常驻 UI 区域（黑框提示/力度条）从球检测中排除，
+        # 防止框内白字被当成球误检（bug7 黑框问题）。
+        exclude_mask=ctx.occ_streak.get("static"),
     )
     balls_t = [vision.Ball(
         b.label,
@@ -1088,10 +1111,12 @@ def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
     segs.append({"pts": [ghost_s, target_s], "color": "#f97316", "width": 5, "dash": True})
     segs.append({"pts": [target_s, pocket_s], "color": "#facc15", "width": 4, "dash": True})
     # 白球切线轨迹：碰后母球沿切线方向滚动；指向袋口（摔袋）时用红色警示
+    # 裁剪到台面矩形内（Liang-Barsky 思想）：切线过长伸出桌外会误导击球
     tdir, tfrac = physics.cue_tangent(shot)
     if tfrac > 0.17:
         L = physics.clamp(W * 0.55 * (power / 100.0) * tfrac, 0.12 * W, 0.8 * W)
         end_t = (shot.ghost[0] + tdir[0] * L, shot.ghost[1] + tdir[1] * L)
+        end_t = _clip_ray_end(shot.ghost, end_t, W, H)
         end_s = vision.point_table_to_screen(end_t, Hinv)
         risk = physics.scratch_risk(shot, r, cfg.pocket_accept_ratio * r,
                                     pockets_t, max(W, H))

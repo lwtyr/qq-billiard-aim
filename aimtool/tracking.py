@@ -252,6 +252,13 @@ class TableStateTracker:
             self._stable_since = None
             self._previous = current
             return self.state
+        # 新局铺球/大量收球：球数突变时给画面一个稳定窗口，
+        # 避免过渡动画期间用残缺检测乱出辅助线（开局闪线问题）。
+        if abs(len(current) - len(self._previous)) >= 6:
+            self.state = TableState.STABILIZING
+            self._stable_since = None
+            self._previous = current
+            return self.state
 
         speeds = []
         for track_id, (pos, captured_at) in current.items():

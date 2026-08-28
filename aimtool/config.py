@@ -97,7 +97,9 @@ class Config:
     track_max_misses: int = 2
     stationary_speed: float = 18.0
     moving_speed: float = 85.0
-    settle_seconds: float = 0.24
+    # 静止多久后才认为局面就绪（打完一杆球停稳后出线的延迟）。
+    # 0.15s 在 60fps 下约 9 帧，兼顾防误击与响应速度。
+    settle_seconds: float = 0.15
 
     # 经验物理标定。默认不改变直球几何；实测后可在配置文件中调整。
     ball_radius_scale: float = 1.0

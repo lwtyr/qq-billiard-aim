@@ -653,8 +653,12 @@ def detect_table_occlusion(warped: np.ndarray, cfg, r: float,
         if short_side < 3.0 * r or long_side > 2.5 * max(short_side, 1e-6):
             continue
         # 纯暗大块是球群阴影/袋口/黑球，不是界面；真菜单是白/灰亮面板。
+        # 但黑底白字的提示框（游戏犯规/自由球弹窗）白字占比不高，
+        # 整块均值仍暗——若也跳过，框内白字会被当成白球误检（bug7）。
+        # 规则：整块暗且几乎无亮像素 → 阴影，跳过；含明显亮内容 → 界面。
         comp_px = warped[lab == idx]
-        if float(comp_px.max(axis=1).mean()) < 60.0:
+        vals = comp_px.max(axis=1)
+        if float(vals.mean()) < 60.0 and int((vals >= 200).sum()) < 0.01 * vals.size:
             continue
         mask = np.zeros(foreign.shape, np.uint8)
         mask[ys_, xs_] = 255

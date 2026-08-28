@@ -84,3 +84,52 @@ def test_dark_shade_still_skipped():
     cv2.rectangle(img, (400, 300), (900, 600), (10, 20, 10), -1)
     occ = vision_mod.detect_table_occlusion(img, _cfg(), 20.0)
     assert occ is None
+
+
+# ---- bug7：切线裁剪 / 学习区不误检 / 新局铺球稳定窗 ----
+
+
+def test_clip_ray_end():
+    from main import _clip_ray_end
+    # 完全在台内：不变
+    assert _clip_ray_end((100, 100), (200, 150), 1000, 500) == (200, 150)
+    # 斜向伸出右边：端点裁到 x=w（t=900/1100，y=100+250t≈304.55）
+    ex, ey = _clip_ray_end((100, 100), (1200, 350), 1000, 500)
+    assert ex == 1000 and abs(ey - 304.55) < 0.01
+    # 斜向伸出上边：端点裁到 y=0
+    ex, ey = _clip_ray_end((500, 100), (700, -300), 1000, 500)
+    assert abs(ex - 550.0) < 0.01 and ey == 0.0
+    # 纯向上：裁到 y=0
+    assert _clip_ray_end((500, 100), (500, -900), 1000, 500) == (500, 0.0)
+
+
+def test_learned_static_area_excludes_balls():
+    """黑框提示框（常驻 UI）学习后，框内白字不再被识别为球。"""
+    img = _felt_frame()
+    # 黑框 + 白字（模拟游戏提示框）
+    cv2.rectangle(img, (742, 372), (1259, 629), (30, 30, 30), -1)
+    cv2.rectangle(img, (900, 480), (1100, 520), (250, 250, 250), -1)
+    occ = vision_mod.detect_table_occlusion(img, _cfg(), 20.0)
+    assert occ is not None
+    static = occ["mask"]
+    balls = vision_mod.detect_balls(img, 20.0, cfg=_cfg(),
+                                    exclude_mask=static)
+    assert all(not (900 < b.pos[0] < 1100 and 480 < b.pos[1] < 520)
+               for b in balls), "学习区内仍检出假球"
+
+
+def test_ball_count_jump_delays_ready():
+    """新局铺球（球数突增≥6）时保持 STABILIZING，不立即出线。"""
+    from aimtool.tracking import Ball as TBall, TableState, TableStateTracker
+    from aimtool import config as config_mod
+    st = TableStateTracker(config_mod.Config(settle_seconds=0.0))
+
+    def balls(n):
+        return [TBall("white", (50.0 + 40 * i, 50.0), 10.0,
+                      track_id=i) for i in range(n)]
+
+    st.update(balls(3), 0.0)
+    st.update(balls(3), 0.033)                    # 稳定小局面
+    assert st.update(balls(22), 0.066) is not TableState.READY  # 突增→不就绪
+    assert st.update(balls(22), 0.10) is not TableState.READY   # 静止计时起点
+    assert st.update(balls(22), 0.15) is TableState.READY       # 稳定→就绪
