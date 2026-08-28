@@ -115,7 +115,7 @@ except ModuleNotFoundError as exc:
         "请在项目目录运行: python -m pip install -r requirements.txt"
     )
 
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.5.1"
 
 HELP_TEXT = ("1-6 选袋口 | 0 自动 | G 点选目标球 | M 手动录入 | R 框选区域 | K 库边解围 | "
              "Q 红/彩切换 | O 兼容切换 | P 自动袋口 | B 球标注 | X 穿透 | T 隐藏 | C 重识别 | Esc 退出")
@@ -854,7 +854,16 @@ class App:
     def __init__(self, cfg: config_mod.Config, region: Optional[List[int]] = None,
                  start_manual: bool = False):
         self.cfg = cfg
-        self.region = region or cfg.capture_region
+        self.region = (list(region) if region is not None else
+                       (list(cfg.capture_region) if cfg.capture_region else None))
+        # Every frame must be analyzed in the capture coordinate system it was
+        # taken from.  The generation rejects packets that crossed an R-key or
+        # automatic re-anchor region change while waiting for analysis.
+        self._capture_generation = 0
+        # A configured region is user-owned and must remain fixed.  Automatic
+        # framing is only allowed for the first successful full-screen detect;
+        # a moved window is recovered by the no-table full-screen fallback.
+        self._auto_region_enabled = region is None and not cfg.capture_region
         self.mode = "manual" if start_manual else "auto"
         self.pick_mode = False                              # G 键：点选目标球中
         self.picked_target: Optional[physics.Point] = None  # 用户点选的目标球（台面坐标）
@@ -884,20 +893,39 @@ class App:
         self._capture_err: Optional[str] = None
 
     # ---------- 后台线程 ----------
+    def _capture_context(self) -> Tuple[Optional[Tuple[int, int, int, int]], int]:
+        """Return an immutable snapshot of the current capture context."""
+        region = (tuple(int(value) for value in self.region)
+                  if self.region else None)
+        return region, int(getattr(self, "_capture_generation", 0))
+
+    def _advance_capture_generation(self) -> None:
+        """Invalidate frames captured before a region/coordinate change."""
+        self._capture_generation = int(getattr(self, "_capture_generation", 0)) + 1
+
+    def _packet_matches_current(self, packet) -> bool:
+        region, generation = self._capture_context()
+        return (getattr(packet, "capture_region", None) == region
+                and int(getattr(packet, "capture_generation", 0)) == generation)
+
     def _capture_loop(self) -> None:
         last_error = None
         last_report = 0.0
         while self.running:
             try:
-                self.frame = capture.grab(self.region)
+                capture_region, capture_generation = self._capture_context()
+                capture_arg = (list(capture_region)
+                               if capture_region is not None else None)
+                self.frame = capture.grab(capture_arg)
                 # 同步叠加层自绘掩膜：与刚抓到的帧同一时刻的画面内容，
                 # analyze() 用它把自家画线填回台呢色，杜绝自截屏干扰。
-                self.frame_mask = self._snapshot_overlay_mask()
+                self.frame_mask = self._snapshot_overlay_mask(capture_region)
                 # 一个 packet 同时封存帧和遮罩，检测线程不会再拿到新帧+旧遮罩。
                 store = getattr(self, "frame_store", None)
                 if store is None:
                     store = self.frame_store = tracking.FrameStore()
-                store.publish(self.frame, self.frame_mask)
+                store.publish(self.frame, self.frame_mask,
+                              capture_region, capture_generation)
                 if self._capture_err:
                     print("[截屏] 已恢复", flush=True)
                 self._capture_err = None
@@ -916,7 +944,9 @@ class App:
                 continue
             time.sleep(1.0 / max(1.0, self.cfg.capture_fps))
 
-    def _snapshot_overlay_mask(self) -> Optional[np.ndarray]:
+    def _snapshot_overlay_mask(
+            self, capture_region: Optional[Tuple[int, int, int, int]] = None
+    ) -> Optional[np.ndarray]:
         """当前叠加层画过的像素（屏幕坐标 → 截屏区域坐标）。
 
         读取不抛异常：叠加层可能尚未初始化/已销毁/是 Tk 回退路径。
@@ -930,8 +960,8 @@ class App:
                 return None
             if dm.dtype != np.uint8:
                 dm = (dm > 0).astype(np.uint8)
-            if self.region:
-                rx, ry, rw, rh = (int(v) for v in self.region)
+            if capture_region is not None:
+                rx, ry, rw, rh = (int(v) for v in capture_region)
                 if rx < 0 or ry < 0 or rx + rw > dm.shape[1] or ry + rh > dm.shape[0]:
                     return None
                 return np.ascontiguousarray(dm[ry:ry + rh, rx:rx + rw])
@@ -949,6 +979,12 @@ class App:
             due = now - getattr(self, "_last_analysis_at", 0.0) >= 1.0 / analysis_fps
             if fresh and due:
                 self._last_packet_sequence = packet.sequence
+                # Region changes are handled by the UI/capture thread while
+                # analysis may be busy.  Never attach the current region
+                # origin or tracker state to an older frame.
+                if not self._packet_matches_current(packet):
+                    time.sleep(0.004)
+                    continue
                 self._last_analysis_at = now
                 if self.mode == "region":
                     # 手动框选模式：不覆盖场景，等用户拖框（否则框选提示被冲掉）
@@ -976,8 +1012,15 @@ class App:
                         # 捕获区域模式：识别输出的是区域局部坐标，而 Overlay
                         # 全屏窗口从 (0,0) 画起——不补偿 region 原点会让所有
                         # 绘制整体偏移 (rx, ry)。先把场景平移到全屏坐标系。
-                        if self.region:
-                            self._offset_scene(scene, float(self.region[0]), float(self.region[1]))
+                        if packet.capture_region is not None:
+                            self._offset_scene(
+                                scene, float(packet.capture_region[0]),
+                                float(packet.capture_region[1]))
+                        # A region can change during the relatively expensive
+                        # OpenCV pass.  Drop that result before it can update
+                        # the visible scene or automatic framing state.
+                        if not self._packet_matches_current(packet):
+                            continue
                         if self.pick_mode:
                             # 点选模式提示不被每帧识别结果冲掉
                             scene["hint"] = "点选目标：点击要打的球（母球/袋口自动选），再按 G 取消"
@@ -997,8 +1040,8 @@ class App:
                         if scene.get("status") == "未检测到台面" and self.region:
                             self.region = None
                             self.cfg.capture_region = None
-                            self.tracker = vision.TableTracker(self.cfg)
-                            self.pocket_tracker = vision.PocketTracker(self.cfg)
+                            self._auto_region_enabled = True
+                            self._advance_capture_generation()
                             self._reset_tracking()
                         if now - self._last_perf_report >= 5.0:
                             self._last_perf_report = now
@@ -1074,8 +1117,7 @@ class App:
                 v["y"] += dy
 
     def _reset_tracking(self) -> None:
-        """捕获区域变更后调用：旧 tracker 的 EMA 四边形是另一套坐标系，
-        继续平滑会混入错误坐标；历史线段/单应阵同样作废。"""
+        """捕获区域变更后丢弃旧坐标系的 tracker 和瞄准历史。"""
         self.tracker = vision.TableTracker(self.cfg) if self.cfg.table_lock else None
         self.pocket_tracker = vision.PocketTracker(self.cfg)
         self.ball_tracker = tracking.BallTracker(self.cfg)
@@ -1090,27 +1132,26 @@ class App:
         self._last_packet_sequence = -1
 
     def _auto_region(self, quad: List) -> None:
-        """截屏区域跟随台面（窗口模式适配）。
+        """在一次可靠的全屏检测后建立固定捕获区域。
 
-        - 全屏模式：首次检测到台面即收缩到台面外扩，消除全屏扫描抖动；
-        - 已有区域：若台面 bbox 明显移出区域（窗口被拖动/缩放），自动跟随更新；
-        - 区域保存在 config，下次启动直接使用。
+        捕获区域一旦由用户 R 键选定，或由首次全屏检测建立，就不再由
+        每帧的四边形候选改写。窗口移动后当前区域会失去台面，检测循环
+        再统一回到全屏并重新建立区域，避免单帧误检把锁定框带走。
         """
+        if not getattr(self, "_auto_region_enabled", True) or self.region:
+            return
         q = np.asarray(quad, dtype=float)
         pad = 25
         x0 = max(0, int(q[:, 0].min()) - pad)
         y0 = max(0, int(q[:, 1].min()) - pad)
         x1 = int(q[:, 0].max()) + pad
         y1 = int(q[:, 1].max()) + pad
-        if self.region:
-            rx, ry, rw, rh = self.region
-            moved = (x0 < rx - 40 or y0 < ry - 40
-                     or x1 > rx + rw + 40 or y1 > ry + rh + 40)
-            if not moved:
-                return
         self.region = [x0, y0, x1 - x0, y1 - y0]
         self.cfg.capture_region = self.region
         self.cfg.save()
+        self._auto_region_enabled = False
+        self._advance_capture_generation()
+        print(f"[自动框选] 首次锁定区域: {self.region}", flush=True)
         # 区域变了=坐标系原点变了，历史跟踪全部作废
         self._reset_tracking()
 
@@ -1165,9 +1206,12 @@ class App:
             old_region = self.region or self.cfg.capture_region
             self.region = None
             self.cfg.capture_region = None
+            self._auto_region_enabled = False
+            self._advance_capture_generation()
             print(f"[框选] 进入全屏选择，清除旧区域: {old_region}", flush=True)
-            if old_region is not None:
-                self._reset_tracking()
+            # 即使原本就是全屏模式，也要丢弃旧四边形和旧瞄准线；否则
+            # 框选期间用户会看到上一套坐标系的白色边框仍在漂移。
+            self._reset_tracking()
             try:
                 self.cfg.save()
             except OSError as exc:
@@ -1176,7 +1220,11 @@ class App:
             self._set_click_through(False)
             if self.overlay:
                 self.overlay.begin_region()
-            self.scene["hint"] = "已切换全屏捕获：框选绿色台面（可稍大一点），按住左键拖到对角松开"
+            self.scene = {
+                "status": "等待框选球桌区域",
+                "hint": "已切换全屏捕获：框选绿色台面（可稍大一点），按住左键拖到对角松开",
+                "help": HELP_TEXT,
+            }
         elif keysym == "k":
             cfg.allow_kicks = not cfg.allow_kicks
             cfg.save()
@@ -1307,6 +1355,8 @@ class App:
                 if x1 - x0 > 40 and y1 - y0 > 40:
                     self.region = [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
                     self.cfg.capture_region = self.region
+                    self._auto_region_enabled = False
+                    self._advance_capture_generation()
                     # 区域变了=坐标系变了，旧跟踪/单应阵全部作废
                     self._reset_tracking()
                     try:

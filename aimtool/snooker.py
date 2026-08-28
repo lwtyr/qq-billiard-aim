@@ -34,17 +34,49 @@ class TurnTracker:
     ball_on: Optional[str] = None  # red / color / clear
     _reds: Optional[int] = None
     _colors: Optional[int] = None
+    # Q/O is a session override, separate from the visual rule inference.  A
+    # A stable frame with the same ball counts must not undo a user's toggle;
+    # the override is released when the visible ball counts actually change.
+    _manual_ball_on: Optional[str] = None
+    _manual_counts: Optional[Tuple[int, int]] = None
 
     def reset(self) -> None:
         self.ball_on = None
         self._reds = None
         self._colors = None
+        self._manual_ball_on = None
+        self._manual_counts = None
 
     def update(self, balls: Sequence, stable: bool) -> str:
         reds = reds_remaining(balls)
         colors = sum(1 for b in balls if b.label in COLOR_ORDER)
         if not stable:
             return self.ball_on or ("clear" if reds == 0 else "red")
+
+        if self._manual_ball_on is not None:
+            counts = (reds, colors)
+            if reds == 0:
+                self._manual_ball_on = None
+                self._manual_counts = None
+                if self._reds is None:
+                    # Q pressed before the first frame, and that first frame
+                    # is already a clear-colour position.
+                    self.ball_on = "clear"
+                    self._reds, self._colors = counts
+                    return self.ball_on
+            elif self._manual_counts is None:
+                # Q may have been pressed before the first stable detection.
+                self._manual_counts = counts
+            elif counts != self._manual_counts:
+                # A real ball-count change marks the end of the one-shot user
+                # override; resume the normal red-after-pot/color progression.
+                self._manual_ball_on = None
+                self._manual_counts = None
+            else:
+                self.ball_on = self._manual_ball_on
+                self._reds, self._colors = counts
+                return self.ball_on
+
         if self._reds is None:
             # Q 可能在首个稳定帧前按下；已有手动状态时保留它，
             # 否则按当前台面初始化默认状态。
@@ -72,11 +104,6 @@ class TurnTracker:
         成功入袋。同步 ``_reds``/``_colors`` 很重要：否则在首次识别完成前
         按键，下一次 ``update`` 会把刚切换的状态重新初始化掉。
         """
-        if not balls and self._reds is None:
-            # 尚未得到任何球列表时，仍允许 Q 在默认红球与红后彩球之间
-            # 来回切换；不要把未知状态伪装成“无红球”的清彩状态。
-            self.ball_on = "color" if self.ball_on in (None, "red") else "red"
-            return self.ball_on
         if balls:
             reds = reds_remaining(balls)
             colors = sum(1 for b in balls if b.label in COLOR_ORDER)
@@ -87,12 +114,17 @@ class TurnTracker:
             colors = self._colors or 0
         if reds == 0:
             self.ball_on = "clear"
-        elif self.ball_on in (None, "red"):
-            # 未完成首帧同步时，None 代表默认的红球目标状态；Q 仍应
-            # 像用户看到的“当前是红球”一样切到红后选彩。
-            self.ball_on = "color"
-        else:
-            self.ball_on = "red"
+            self._manual_ball_on = None
+            self._manual_counts = None
+            if balls:
+                self._reds, self._colors = reds, colors
+            return self.ball_on
+
+        current = self.ball_on if self.ball_on in ("red", "color") else "red"
+        self._manual_ball_on = "color" if current == "red" else "red"
+        self._manual_counts = ((reds, colors) if balls or self._reds is not None
+                               else None)
+        self.ball_on = self._manual_ball_on
         if balls:
             self._reds, self._colors = reds, colors
         return self.ball_on

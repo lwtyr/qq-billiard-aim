@@ -122,6 +122,39 @@ def test_capture_loop_retries_without_stopping_app(monkeypatch):
     assert app._capture_err is None
 
 
+def test_old_capture_context_is_rejected_after_region_change():
+    """后台旧帧不能套用框选后的新区域原点。"""
+    app = App.__new__(App)
+    app.region = [200, 100, 640, 360]
+    app._capture_generation = 2
+    old = tracking.FramePacket(
+        sequence=1, captured_at=0.0,
+        frame=np.zeros((2, 2, 3), dtype=np.uint8), self_mask=None,
+        capture_region=None, capture_generation=1)
+    current = tracking.FramePacket(
+        sequence=2, captured_at=0.0,
+        frame=np.zeros((2, 2, 3), dtype=np.uint8), self_mask=None,
+        capture_region=(200, 100, 640, 360), capture_generation=2)
+
+    assert app._packet_matches_current(old) is False
+    assert app._packet_matches_current(current) is True
+
+
+def test_user_capture_region_is_not_replaced_by_auto_frame():
+    """手动 R 选定的区域不应被单帧台面候选重新改写。"""
+    app = App.__new__(App)
+    app.cfg = config.Config(capture_region=[100, 120, 800, 450])
+    app.region = [100, 120, 800, 450]
+    app._auto_region_enabled = False
+    quad = np.array([[500.0, 300.0], [1450.0, 300.0],
+                     [1450.0, 760.0], [500.0, 760.0]])
+
+    app._auto_region(quad)
+
+    assert app.region == [100, 120, 800, 450]
+    assert app.cfg.capture_region == [100, 120, 800, 450]
+
+
 def test_r_key_clears_old_capture_region_before_selection(monkeypatch):
     """重新框选不能继续使用上一次错误/越界的捕获区域。"""
     app = App.__new__(App)

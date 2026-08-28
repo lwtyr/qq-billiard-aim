@@ -27,6 +27,11 @@ class FramePacket:
     captured_at: float
     frame: np.ndarray
     self_mask: Optional[np.ndarray]
+    # The capture origin is part of the frame contract.  A region change can
+    # happen while a frame is waiting for analysis; without this snapshot the
+    # analyzer may apply the new origin to an old frame.
+    capture_region: Optional[Tuple[int, int, int, int]] = None
+    capture_generation: int = 0
 
 
 class FrameStore:
@@ -37,10 +42,16 @@ class FrameStore:
         self._sequence = 0
         self._latest: Optional[FramePacket] = None
 
-    def publish(self, frame: np.ndarray, self_mask: Optional[np.ndarray]) -> FramePacket:
+    def publish(self, frame: np.ndarray, self_mask: Optional[np.ndarray],
+                capture_region: Optional[Iterable[int]] = None,
+                capture_generation: int = 0) -> FramePacket:
         with self._lock:
             self._sequence += 1
-            packet = FramePacket(self._sequence, time.monotonic(), frame, self_mask)
+            region = (None if capture_region is None
+                      else tuple(int(value) for value in capture_region))
+            packet = FramePacket(
+                self._sequence, time.monotonic(), frame, self_mask,
+                region, int(capture_generation))
             self._latest = packet
             return packet
 

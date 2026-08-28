@@ -22,6 +22,17 @@ def test_frame_store_replaces_old_packet_with_latest():
     assert latest.self_mask is not None
 
 
+def test_frame_store_preserves_capture_context_with_packet():
+    """帧必须携带截屏区域和代际，防止换框后的旧帧错用新坐标原点。"""
+    store = tracking.FrameStore()
+    packet = store.publish(
+        np.zeros((2, 2, 3), dtype=np.uint8), None,
+        capture_region=[120, 80, 640, 360], capture_generation=4)
+
+    assert packet.capture_region == (120, 80, 640, 360)
+    assert packet.capture_generation == 4
+
+
 def test_ball_tracker_confirms_tracks_and_deduplicates_unique_color():
     cfg = config.Config(track_confirm_frames=3, track_history_frames=5,
                         track_max_misses=1)

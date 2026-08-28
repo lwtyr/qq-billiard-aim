@@ -229,6 +229,16 @@ def test_q_toggle_before_first_detection_is_preserved():
     assert tracker.update([cue, red], stable=True) == "color"
 
 
+def test_q_before_first_detection_does_not_force_color_without_reds():
+    """首帧已进入清彩阶段时，Q 不能凭空恢复红/彩切换。"""
+    cue = vision.Ball("白球", (300.0, 500.0), 20.0)
+    yellow = vision.Ball("黄球", (700.0, 500.0), 20.0)
+    tracker = snooker.TurnTracker()
+
+    assert tracker.toggle_red_color([]) == "color"
+    assert tracker.update([cue, yellow], stable=True) == "clear"
+
+
 def test_clearance_color_order_advances_after_ball_is_removed(monkeypatch):
     """清彩阶段只按黄→绿→棕顺序，黄进袋后下一杆才到绿球。"""
     cfg = config.Config(allow_kicks=False)

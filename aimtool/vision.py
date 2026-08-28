@@ -1544,13 +1544,14 @@ def refine_pockets(warped: np.ndarray, expected: List[Point], r: float,
     return refined
 
 
-# ---------- 台面四边形跟踪（帧间锁定 + 平滑） ----------
+# ---------- 台面四边形跟踪（帧间锁定 + 重检） ----------
 
 class TableTracker:
-    """台面四边形跟踪：首帧检测后锁定，EMA 平滑角点，周期性重检。
+    """台面四边形跟踪：首帧锁定，周期重检，移动须经稳定确认。
 
     消除「每帧重新 find_table 的抖动」（四边形抖动会直接变成球坐标
-    角度误差）。窗口移动/台面变化时，周期重检 + 连续失败强制解锁兜底。
+    角度误差）。只有同一个刚性偏移连续出现，才接受为窗口移动；单边
+    误检、逐步漂移和短暂漏检都继续使用原锁定框。
     """
 
     def __init__(self, cfg):
@@ -1560,6 +1561,7 @@ class TableTracker:
         self.frame = 0
         self._jump = 0          # 连续大偏移计数（真移动 vs 偶发斜检）
         self._jump_quad: Optional[np.ndarray] = None
+        self._jump_samples: List[np.ndarray] = []
 
     def update(self, frame: np.ndarray) -> Optional[np.ndarray]:
         self.frame += 1
@@ -1570,6 +1572,9 @@ class TableTracker:
         q = find_table(frame, self.cfg)
         if q is None:
             self.miss += 1
+            self._jump = 0
+            self._jump_quad = None
+            self._jump_samples = []
             if self.miss >= self.cfg.table_max_miss:
                 self.quad = None          # 解锁，强制重新检测
             return self.quad
@@ -1578,28 +1583,50 @@ class TableTracker:
             self.quad = q
             self._jump = 0
             self._jump_quad = None
+            self._jump_samples = []
         else:
             # 跳变拒绝：单次重检的角点大偏移多半是边带拟合被污染
             # （库边白线/球贴边/旧版 mss 截到 Overlay）造成的「一边斜」
-            # 坏四边形。保持旧框，连续多次出现同一偏移才认为是窗口真的移动。
+            # 坏四边形。保持旧框，连续多次出现同一刚性偏移才认为是窗口
+            # 真的移动；不能把每次逐步变大的误检当作连续确认。
             shift = float(np.abs(q - self.quad).max())
             jump_thresh = max(3.0, float(getattr(self.cfg, "table_recheck_max_shift", 7.0)))
             if shift > jump_thresh:
-                # 只有候选本身也稳定，才累计确认次数；坏拟合通常每次
-                # 斜向漂移不同，不能靠「连续出现」误触发解锁。
-                if (self._jump_quad is not None
-                        and float(np.abs(q - self._jump_quad).max()) <= jump_thresh):
-                    self._jump += 1
+                # 真正平移时四个角点的 dx/dy 应近似相同；单边被白线、球
+                # 或 UI 污染的候选直接丢弃。
+                delta = q - self.quad
+                rigid_tol = max(
+                    0.75, float(getattr(self.cfg, "table_stable_deadband", 2.0)))
+                delta_center = np.median(delta, axis=0)
+                if float(np.abs(delta - delta_center).max()) > rigid_tol:
+                    self._jump = 0
+                    self._jump_quad = None
+                    self._jump_samples = []
+                    return self.quad
+
+                # 候选必须围绕同一绝对位置聚集。只比较相邻候选会把
+                # (+8),(+13),(+18) 这种静态误检漂移错误地确认成移动。
+                consensus_tol = max(
+                    0.75, float(getattr(self.cfg, "table_stable_deadband", 2.0)))
+                if self._jump_samples:
+                    center = np.median(np.asarray(self._jump_samples), axis=0)
+                    if float(np.abs(q - center).max()) <= consensus_tol:
+                        self._jump_samples.append(q.copy())
+                    else:
+                        self._jump_samples = [q.copy()]
                 else:
-                    self._jump = 1
+                    self._jump_samples = [q.copy()]
+                self._jump = len(self._jump_samples)
                 self._jump_quad = q.copy()
                 confirmations = max(
                     1, int(getattr(self.cfg, "table_move_confirmations", 3)))
                 if self._jump < confirmations:
                     return self.quad       # 丢弃本次可疑检测
-                self.quad = q              # 连续偏移 → 真移动，接受
+                self.quad = np.median(
+                    np.asarray(self._jump_samples), axis=0).astype(np.float32)
                 self._jump = 0
                 self._jump_quad = None
+                self._jump_samples = []
             else:
                 # 锁定框是识别基准，不应把每次重检的 2~7px 边缘噪声
                 # 通过 EMA 累积成可见漂移。只有候选四边形越过
@@ -1607,6 +1634,7 @@ class TableTracker:
                 # 真实窗口移动会在后续重检中继续累积到该阈值。
                 self._jump = 0
                 self._jump_quad = None
+                self._jump_samples = []
         return self.quad
 
 

@@ -217,6 +217,46 @@ def test_table_tracker_does_not_accumulate_subthreshold_noise(monkeypatch):
     assert all(np.array_equal(first, got) for got in outputs)
 
 
+def test_table_tracker_rejects_progressive_large_drift(monkeypatch):
+    """逐次变大的静态误检不能靠相邻帧相近而伪装成窗口移动。"""
+    cfg = config.Config()
+    cfg.table_recheck_frames = 1
+    cfg.table_recheck_max_shift = 7.0
+    cfg.table_move_confirmations = 3
+    base = np.array([[10, 10], [990, 10], [990, 500], [10, 500]], dtype=np.float32)
+    candidates = [base + shift for shift in (8.0, 13.0, 18.0, 23.0)]
+    values = iter((base, *candidates))
+    monkeypatch.setattr(vision, "find_table", lambda _frame, _cfg: next(values))
+    tracker = vision.TableTracker(cfg)
+    frame = np.zeros((500, 1000, 3), dtype=np.uint8)
+
+    first = tracker.update(frame).copy()
+    outputs = [tracker.update(frame).copy() for _ in candidates]
+
+    assert all(np.array_equal(first, got) for got in outputs)
+
+
+def test_table_tracker_accepts_stable_rigid_move_after_confirmation(monkeypatch):
+    """真实的固定平移在连续确认后仍可重新锁定。"""
+    cfg = config.Config(table_recheck_frames=1, table_recheck_max_shift=7.0,
+                        table_move_confirmations=3)
+    base = np.array([[10, 10], [990, 10], [990, 500], [10, 500]], dtype=np.float32)
+    moved = base + 20.0
+    values = iter((base, moved, moved, moved))
+    monkeypatch.setattr(vision, "find_table", lambda _frame, _cfg: next(values))
+    tracker = vision.TableTracker(cfg)
+    frame = np.zeros((500, 1000, 3), dtype=np.uint8)
+
+    first = tracker.update(frame).copy()
+    second = tracker.update(frame).copy()
+    third = tracker.update(frame).copy()
+    fourth = tracker.update(frame).copy()
+
+    assert np.array_equal(first, second)
+    assert np.array_equal(first, third)
+    assert np.array_equal(fourth, moved)
+
+
 def test_pocket_tracker_holds_single_candidate_jump():
     """单帧袋口候选跳点不应改变瞄准袋口。"""
     cfg = config.Config()
