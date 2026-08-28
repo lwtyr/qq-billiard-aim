@@ -242,7 +242,27 @@ def find_table(frame: np.ndarray, cfg) -> Optional[np.ndarray]:
     # 当作首帧台面，后续自动框选会把错误区域保存下来。QQ 2D 桌面
     # 本身轴对齐，真实边缘斜率通常远小于该阈值。
     tl, tr, br, bl = quad
-    edge_skew = max(
+    edge_skew = _quad_skew(quad, bw, bh)
+    if edge_skew > float(getattr(cfg, "table_max_edge_skew", 0.02)):
+        return None
+    # 能通过歪斜检查的四边形一律视作轴对齐台面，用绿色轮廓外接矩形
+    # 正则化。QQ 2D 是纯软件渲染，台面在屏幕上必然是轴对齐矩形；旧版
+    # 此处另有 0.015 的 axis_like 阈值，导致 0.86°~1.15° 之间的轻微
+    # 歪斜（bug2：左库被污染拉斜 8px，skew=0.0154）逃过正则化被锁定
+    # 固化——白框长期歪斜且在歪/正之间切换时抖动。
+    box_quad = np.array(
+        [[x, y], [x + bw, y], [x + bw, y + bh], [x, y + bh]],
+        dtype=np.float32,
+    )
+    if _quad_sane(box_quad):
+        quad = box_quad
+    return quad
+
+
+def _quad_skew(quad: np.ndarray, bw: float, bh: float) -> float:
+    """轴对齐偏差：上下边高差、左右边横差、对边不等长，取最大比例。"""
+    tl, tr, br, bl = quad
+    return max(
         abs(float(tr[1] - tl[1])) / max(1.0, bw),
         abs(float(br[1] - bl[1])) / max(1.0, bw),
         abs(float(bl[0] - tl[0])) / max(1.0, bh),
@@ -250,22 +270,6 @@ def find_table(frame: np.ndarray, cfg) -> Optional[np.ndarray]:
         abs(float(np.linalg.norm(tr - tl) - np.linalg.norm(br - bl)))
         / max(1.0, bw),
     )
-    if edge_skew > float(getattr(cfg, "table_max_edge_skew", 0.02)):
-        return None
-    axis_like = (
-        max(abs(float(quad[1, 1] - quad[0, 1])),
-            abs(float(quad[2, 1] - quad[3, 1]))) < 0.015 * max(1, bw)
-        and max(abs(float(quad[3, 0] - quad[0, 0])),
-                abs(float(quad[2, 0] - quad[1, 0]))) < 0.015 * max(1, bh)
-    )
-    if axis_like:
-        box_quad = np.array(
-            [[x, y], [x + bw, y], [x + bw, y + bh], [x, y + bh]],
-            dtype=np.float32,
-        )
-        if _quad_sane(box_quad):
-            quad = box_quad
-    return quad
 
 
 def _quad_sane(quad: np.ndarray) -> bool:
@@ -1665,6 +1669,21 @@ class TableTracker:
             self._jump = 0
             self._jump_samples = []
         else:
+            # 旧版本可能已锁定被污染拉斜的台面（bug2：左库歪 8px）。
+            # 新版 find_table 输出已正则化为轴对齐矩形；若锁定框仍带
+            # 明显歪斜而候选是正框，说明锁定框是历史遗留，直接换新，
+            # 不受跳变拒绝与确认计数约束。
+            bw_l = float(np.linalg.norm(self.quad[1] - self.quad[0]))
+            bh_l = float(np.linalg.norm(self.quad[3] - self.quad[0]))
+            bw_q = float(np.linalg.norm(q[1] - q[0]))
+            bh_q = float(np.linalg.norm(q[3] - q[0]))
+            if (_quad_skew(self.quad, bw_l, bh_l) > 0.005
+                    and _quad_skew(q, bw_q, bh_q) < 0.005):
+                self.quad = q
+                self._jump = 0
+                self._jump_samples = []
+                return self.quad
+
             # 跳变拒绝：单次重检的角点大偏移多半是边带拟合被污染
             # （库边白线/球贴边/旧版 mss 截到 Overlay）造成的「一边斜」
             # 坏四边形。保持旧框，连续多次出现同一刚性偏移才认为是窗口
