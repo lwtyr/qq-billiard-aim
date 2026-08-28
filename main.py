@@ -19,7 +19,8 @@ import sys
 import threading
 import time
 import traceback
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 _RUNTIME_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime.log")
@@ -135,6 +136,9 @@ COLOR_HEX = {
 _warn_state = {"key": None, "t": 0.0}
 _white_state = {"n": 0}
 _save_state = {"key": None, "t": 0.0}
+# blank_self_mask 的自绘像素还原信息。_save_bad_frame 写盘前据此把
+# 已被填回台呢色的像素恢复成原始画面（见 vision.blank_self_mask）。
+_self_paint: Dict = {"restore": None}
 _BAD_FRAME_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_frames")
 _SAVE_INTERVAL = 30.0   # 同一异常 30 秒内只存一张现场帧，避免刷盘
 _BAD_FRAME_PREFIX = "bad2_"  # 新格式；保留旧 bad_HHMMSS.png 诊断文件
@@ -256,6 +260,18 @@ def _save_bad_frame(frame: np.ndarray) -> Optional[str]:
         filename = (f"{_BAD_FRAME_PREFIX}{time.strftime('%Y%m%d_%H%M%S')}_"
                     f"{os.getpid()}_{stamp}.png")
         path = os.path.join(_BAD_FRAME_DIR, filename)
+        restore = _self_paint.get("restore")
+        if restore is not None:
+            ys, xs, pixels = restore
+            if (len(ys.shape) == 1 and len(xs.shape) == 1
+                    and ys.size == xs.size == pixels.shape[0]
+                    and pixels.shape[1] == frame.shape[2]
+                    and (ys.size == 0 or
+                         (ys.max() < frame.shape[0] and xs.max() < frame.shape[1]))):
+                # 在副本上还原后存盘：不污染分析中的帧（叠加线恢复可见，
+                # 诊断遮挡误报时恰需要看到自家画线与真实画面的叠加关系）。
+                frame = frame.copy()
+                frame[ys, xs] = pixels
         if not cv2.imwrite(path, frame):
             return None
 
@@ -278,19 +294,25 @@ def _save_bad_frame(frame: np.ndarray) -> Optional[str]:
         return None
 
 
-def _warn_once(msg: str, frame: Optional[np.ndarray] = None) -> None:
-    """节流警告：同一内容 5 秒内不重复打印，避免实机刷屏。
+def _warn_once(msg: str, frame: Optional[np.ndarray] = None,
+               key: Optional[str] = None) -> None:
+    """节流警告：同一类别 5 秒内不重复打印，避免实机刷屏。
 
-    附带 frame 时存原始帧到 debug_frames/，同一异常 30 秒内只存一次。
+    key 是节流类别（如 "occlusion"）；消息正文里的每帧变化数值
+    （面积/球数/明细）不再参与节流判断。旧实现以整条消息做 key，
+    遮挡消息含每帧变化的 bbox/fill → key 恒新 → 节流失效，
+    遮挡期间每帧打印+每帧存 PNG（实测 30 次/秒的 IO 风暴）。
+    附带 frame 时存原始帧到 debug_frames/，同一类别 30 秒内只存一次。
     """
     now = time.monotonic()
-    if msg != _warn_state["key"] or now - _warn_state["t"] > 5.0:
+    key = msg if key is None else key
+    if key != _warn_state["key"] or now - _warn_state["t"] > 5.0:
         print(msg, flush=True)
-        _warn_state["key"] = msg
+        _warn_state["key"] = key
         _warn_state["t"] = now
-        if frame is not None and (msg != _save_state["key"]
+        if frame is not None and (key != _save_state["key"]
                                   or now - _save_state["t"] > _SAVE_INTERVAL):
-            _save_state["key"] = msg
+            _save_state["key"] = key
             _save_state["t"] = now
             path = _save_bad_frame(frame)
             if path:
@@ -347,30 +369,83 @@ def _geometry_radius(ball, fallback: float, cfg) -> float:
     return (1.0 - weight) * fallback + weight * observed
 
 
-def analyze(frame: np.ndarray, cfg: config_mod.Config,
-            manual_cue: Optional[physics.Point] = None,
-            manual_target: Optional[physics.Point] = None,
-            manual_pocket_idx: Optional[int] = None,
-            picked_target: Optional[physics.Point] = None,
-            tracker: Optional[vision.TableTracker] = None,
-            prefer_target: Optional[physics.Point] = None,
-            prefer_pocket: Optional[physics.Point] = None,
-            pocket_tracker: Optional[vision.PocketTracker] = None,
-            smooth: Optional[Dict] = None,
-            self_mask: Optional[np.ndarray] = None,
-            occl_state: Optional[Dict] = None,
-            ball_tracker: Optional[tracking.BallTracker] = None,
-            table_state: Optional[tracking.TableStateTracker] = None,
-            turn_tracker: Optional[snooker.TurnTracker] = None,
-            captured_at: Optional[float] = None) -> Dict:
-    """一帧 → 场景描述（屏幕坐标，供 Overlay 直接绘制）。"""
-    started_at = time.perf_counter()
+@dataclass
+class _AnalysisContext:
+    """analyze() 的帧级上下文：输入参数 + 各阶段共享产物。
+
+    原 530 行 analyze() 拆成 7 个 _stage_* 纯函数，ctx 负责在阶段间
+    传递中间产物；任一阶段返回 scene 即提前结束（顺序见 analyze()）。
+    """
+    # ---- 输入参数（原 analyze 签名，顺序一致）----
+    frame: np.ndarray
+    cfg: config_mod.Config
+    manual_cue: Optional[physics.Point] = None
+    manual_target: Optional[physics.Point] = None
+    manual_pocket_idx: Optional[int] = None
+    picked_target: Optional[physics.Point] = None
+    tracker: Optional[vision.TableTracker] = None
+    prefer_target: Optional[physics.Point] = None
+    pocket_tracker: Optional[vision.PocketTracker] = None
+    smooth: Optional[Dict] = None
+    self_mask: Optional[np.ndarray] = None
+    ball_tracker: Optional[tracking.BallTracker] = None
+    table_state: Optional[tracking.TableStateTracker] = None
+    turn_tracker: Optional[snooker.TurnTracker] = None
+    captured_at: Optional[float] = None
+    # ---- 标准台面尺寸 ----
+    W: int = 0
+    H: int = 0
+    # ---- _stage_find_table 产物 ----
+    quad: Optional[np.ndarray] = None
+    Hm: Optional[np.ndarray] = None
+    Hinv: Optional[np.ndarray] = None
+    scale: float = 1.0
+    analysis_w: int = 0
+    analysis_h: int = 0
+    r_analysis: float = 0.0
+    warped: Optional[np.ndarray] = None
+    warped_hsv: Optional[np.ndarray] = None
+    warped_gray: Optional[np.ndarray] = None
+    felt_hsv: Optional[tuple] = None
+    protect_masks: Optional[Dict] = None
+    foreign_mask: Optional[np.ndarray] = None
+    # ---- _stage_pockets 产物 ----
+    pockets_analysis: List[physics.Point] = field(default_factory=list)
+    pockets_t: List[physics.Point] = field(default_factory=list)
+    # ---- _stage_balls 产物 ----
+    balls_t: List = field(default_factory=list)
+    r: float = 0.0
+    # ---- _stage_scene 产物 ----
+    scene: Dict = field(default_factory=dict)
+    manual_override: bool = False
+    table_phase: Any = None
+    # ---- _stage_targets 产物 ----
+    cue_t: Optional[physics.Point] = None
+    cue_b: Any = None
+    target_t: Optional[physics.Point] = None
+    target_b: Any = None
+    others: List[physics.Point] = field(default_factory=list)
+    cue_radius: float = 0.0
+    target_radius: float = 0.0
+    ghost_offset: tuple = (0.0, 0.0)
+    break_mode: bool = False
+    rule_text: str = ""
+
+
+def _stage_find_table(ctx: _AnalysisContext) -> Optional[Dict]:
+    """阶段①：自绘清理 + 台面四边形锁定 + 透视变换与帧级共享视觉产物。"""
+    frame = ctx.frame
+    cfg = ctx.cfg
+    W, H = ctx.W, ctx.H
+    tracker = ctx.tracker
+    self_mask = ctx.self_mask
+    captured_at = ctx.captured_at
     W, H = cfg.table_w, cfg.table_h
     captured_at = time.monotonic() if captured_at is None else captured_at
     # 自截屏清理：叠加层画过的像素先填回台呢色。全屏顶层透明窗的
     # 画线会被截屏一起抓进帧里，遮挡检测把自家的线误判为弹窗
     # （实测：命中块 99% 像素是画线颜色）。
-    vision.blank_self_mask(frame, self_mask, cfg)
+    _self_paint["restore"] = vision.blank_self_mask(frame, self_mask, cfg)
     if tracker is not None:
         quad = tracker.update(frame)
     else:
@@ -402,9 +477,40 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
     warped_hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
     warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     felt_hsv = vision.estimate_felt_hsv(warped, cfg, hsv=warped_hsv)
+    # 帧级颜色掩膜字典：台呢清理（_protect_mask）、外来检测（红球保护）、
+    # UI 排除（白球预判）共用同一份，代替原先同一组全帧布尔运算×3 重复。
+    _h_ch, _s_ch, _v_ch = cv2.split(warped_hsv)
+    protect_masks = vision.compute_label_masks(_h_ch, _s_ch, _v_ch)
     foreign_mask = vision.compute_foreign_mask(
-        warped, cfg, r_analysis, hsv=warped_hsv, felt_hsv=felt_hsv)
+        warped, cfg, r_analysis, hsv=warped_hsv, felt_hsv=felt_hsv,
+        label_masks=protect_masks)
 
+
+
+    ctx.quad = quad
+    ctx.Hm = Hm
+    ctx.Hinv = Hinv
+    ctx.scale = np.hypot(*(quad[1] - quad[0])) / W
+    ctx.analysis_w = analysis_w
+    ctx.analysis_h = analysis_h
+    ctx.r_analysis = r_analysis
+    ctx.warped = warped
+    ctx.warped_hsv = warped_hsv
+    ctx.warped_gray = warped_gray
+    ctx.felt_hsv = felt_hsv
+    ctx.protect_masks = protect_masks
+    ctx.foreign_mask = foreign_mask
+    return None
+
+
+def _stage_pockets(ctx: _AnalysisContext) -> Optional[Dict]:
+    """阶段②：袋口定位（默认 → 暗域精修 → 跟踪器锁定），无早退。"""
+    cfg = ctx.cfg
+    W, H = ctx.W, ctx.H
+    pocket_tracker = ctx.pocket_tracker
+    analysis_w, analysis_h = ctx.analysis_w, ctx.analysis_h
+    warped = ctx.warped
+    r_analysis = ctx.r_analysis
     # 袋口必须先于球检测：clean_background 按袋口位置挖洞，
     # 若用默认角点 (0,0) 等，真实内缩袋口区域不被涂灰，会被当成
     # 白球/黑球候选（实测每帧多出 4~10 个假球）。
@@ -436,6 +542,30 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
         for x, y in pockets_t
     ]
 
+
+
+    ctx.pockets_analysis = pockets_analysis
+    ctx.pockets_t = pockets_t
+    return None
+
+
+def _stage_balls(ctx: _AnalysisContext) -> Optional[Dict]:
+    """阶段③：遮挡检测（早退）→ UI 排除 → 台呢清理 → 球检测 → 袋口标定 → 半径估计。"""
+    frame = ctx.frame
+    cfg = ctx.cfg
+    W, H = ctx.W, ctx.H
+    quad, Hm, Hinv = ctx.quad, ctx.Hm, ctx.Hinv
+    r_analysis = ctx.r_analysis
+    warped = ctx.warped
+    warped_hsv, warped_gray = ctx.warped_hsv, ctx.warped_gray
+    felt_hsv = ctx.felt_hsv
+    protect_masks = ctx.protect_masks
+    foreign_mask = ctx.foreign_mask
+    pockets_analysis, pockets_t = ctx.pockets_analysis, ctx.pockets_t
+    analysis_w, analysis_h = ctx.analysis_w, ctx.analysis_h
+    table_state = ctx.table_state
+    captured_at = ctx.captured_at
+    smooth = ctx.smooth
     # QQ 菜单/设置窗口/提示弹窗会把大块白灰面板送进白球掩膜，
     # 造成大量假球。污染帧必须暂停瞄准，不能沿用上一帧方案继续显示。
     # 不再把任何一帧的外来像素立即“学习”为静态背景：旧实现会把真菜单
@@ -445,8 +575,8 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
         felt_hsv=felt_hsv)
     if occlusion is not None:
         # 诊断日志：真实遮挡 vs 球杆/反光误报，把触发块的特征记下来
-        _warn_once(f"[遮挡] 检测到遮挡: {occlusion}", frame)
-        scale = np.hypot(*(quad[1] - quad[0])) / W
+        _warn_once(f"[遮挡] 检测到遮挡: {occlusion}", frame, key="occlusion")
+        scale = ctx.scale
         ball_r_screen = max(4.0, cfg.ball_radius_ratio * W * scale)
         scene = {
             "table_quad": quad.tolist(),
@@ -470,10 +600,10 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
         return scene
     ui_mask = vision.transient_ui_mask(
         warped, cfg, r_analysis, hsv=warped_hsv, gray=warped_gray,
-        foreign=foreign_mask, felt_hsv=felt_hsv)
+        foreign=foreign_mask, felt_hsv=felt_hsv, label_masks=protect_masks)
     clean = vision.clean_background(warped, cfg, r_analysis, pockets_analysis,
                                     exclude_mask=ui_mask, hsv=warped_hsv,
-                                    felt_hsv=felt_hsv)
+                                    felt_hsv=felt_hsv, label_masks=protect_masks)
     balls_analysis = vision.detect_balls(
         warped, r_analysis, cfg=cfg, pockets=pockets_analysis, clean=clean,
         warped_hsv=warped_hsv, warped_gray=warped_gray,
@@ -505,6 +635,28 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
     if smooth is not None:
         r = _ema_scalar(smooth, "r", r)
 
+
+
+    ctx.balls_t = balls_t
+    ctx.pockets_t = pockets_t
+    ctx.r = r
+    return None
+
+
+def _stage_scene(ctx: _AnalysisContext) -> Optional[Dict]:
+    """阶段④：屏幕坐标上下文 + 跟踪器更新 + 运动状态机（非 READY 早退）。"""
+    cfg = ctx.cfg
+    W, H = ctx.W, ctx.H
+    quad, Hm, Hinv = ctx.quad, ctx.Hm, ctx.Hinv
+    r = ctx.r
+    pockets_t = ctx.pockets_t
+    balls_t = ctx.balls_t
+    ball_tracker = ctx.ball_tracker
+    table_state = ctx.table_state
+    captured_at = ctx.captured_at
+    analysis_w, analysis_h = ctx.analysis_w, ctx.analysis_h
+    manual_cue, manual_target = ctx.manual_cue, ctx.manual_target
+    manual_pocket_idx = ctx.manual_pocket_idx
     # 先建立坐标上下文。即使球识别失败，M 手动录入也仍需要这套
     # 屏幕→台面矩阵；旧逻辑在球数校验前返回，导致手动兜底无法启动。
     scale = np.hypot(*(quad[1] - quad[0])) / W
@@ -555,6 +707,23 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
         scene.update({"status": status, "hint": hint, "invalid": True})
         return scene
 
+
+
+    ctx.scene = scene
+    ctx.manual_override = manual_override
+    ctx.table_phase = table_phase
+    ctx.balls_t = balls_t
+    ctx.scale = scale
+    return None
+
+
+def _stage_validate(ctx: _AnalysisContext) -> Optional[Dict]:
+    """阶段⑤：对局画面校验（球数/白球数/红球数三道早退闸门）。"""
+    cfg = ctx.cfg
+    frame = ctx.frame
+    balls_t = ctx.balls_t
+    manual_override = ctx.manual_override
+    scene = ctx.scene
     # 对局画面校验：候选球数异常说明当前画面不是斯诺克台面
     # （大厅界面/桌面浅色区域被 watershed 切碎成大量"球"候选）。
     # 白球数量是最可靠信号（只可能有 1 个）；总球数放宽到 60——
@@ -564,7 +733,8 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
         from collections import Counter
         detail = dict(Counter(b.label for b in balls_t))
         _warn_once(f"[识别异常] 球数={len(balls_t)} 白球候选={n_white} "
-                   f"上限={cfg.detect_max_balls} 明细={detail}", frame)
+                   f"上限={cfg.detect_max_balls} 明细={detail}", frame,
+                   key="balls_too_many")
         scene.update({
             "status": "自动识别异常，请按 R 重新框选",
             "hint": "框选范围尽量紧贴绿色台面（别框进四周界面）。"
@@ -586,7 +756,8 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
         # 决策层会按清彩顺序打错球（实战送分），拒绝输出方案。
         from collections import Counter
         detail = dict(Counter(b.label for b in balls_t))
-        _warn_once(f"[识别异常] 无红球但总数={len(balls_t)} 明细={detail}", frame)
+        _warn_once(f"[识别异常] 无红球但总数={len(balls_t)} 明细={detail}", frame,
+                   key="no_red_balls")
         scene.update({
             "status": "自动识别异常，请按 R 重新框选",
             "hint": "疑似红球漏检（球被遮挡或框选偏移）。框选紧贴台面后按 C 重试",
@@ -594,6 +765,28 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
         })
         return scene
 
+
+
+    return None
+
+
+def _stage_targets(ctx: _AnalysisContext) -> Optional[Dict]:
+    """阶段⑥：母球/目标球选择（手动点选吸附 → 决策层 → 开局解球兜底）+ break 模式渲染早退。"""
+    cfg = ctx.cfg
+    W, H = ctx.W, ctx.H
+    r = ctx.r
+    balls_t = ctx.balls_t
+    pockets_t = ctx.pockets_t
+    scene = ctx.scene
+    manual_cue, manual_target = ctx.manual_cue, ctx.manual_target
+    picked_target = ctx.picked_target
+    prefer_target = ctx.prefer_target
+    turn_tracker = ctx.turn_tracker
+    table_phase = ctx.table_phase
+    ball_tracker = ctx.ball_tracker
+    smooth = ctx.smooth
+    scale = ctx.scale
+    Hinv = ctx.Hinv
     # 母球 / 目标球（斯诺克决策层；支持手动录入覆盖）
     # prefer_target：上一帧目标只用于规则键完全打平时的稳定性；自动袋口
     # 现在始终按同一套切角/离袋距离优先级重新选择，不沿用旧袋口。
@@ -720,9 +913,35 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
                               "pocket": None}
         scene["status"] = "开局解球 | 目标外层红球 | 不代表入袋路线"
         scene["hint"] = "把白球中心对准虚线圆（绿线末端）中心打，先撞散红球架"
-        scene["analysis_ms"] = round((time.perf_counter() - started_at) * 1000.0, 1)
         return scene
 
+
+
+    ctx.cue_t, ctx.cue_b = cue_t, cue_b
+    ctx.target_t, ctx.target_b = target_t, target_b
+    ctx.others = others
+    ctx.cue_radius = cue_radius
+    ctx.target_radius = target_radius
+    ctx.ghost_offset = ghost_offset
+    ctx.break_mode = break_mode
+    ctx.rule_text = rule_text
+    return None
+
+
+def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
+    """阶段⑦：路线规划（手动/自动）+ 力度推荐 + 线段渲染 + 最终场景。"""
+    cfg = ctx.cfg
+    W, H = ctx.W, ctx.H
+    r = ctx.r
+    pockets_t = ctx.pockets_t
+    scene = ctx.scene
+    cue_t, target_t = ctx.cue_t, ctx.target_t
+    others = ctx.others
+    Hinv = ctx.Hinv
+    scale = ctx.scale
+    cue_radius, target_radius = ctx.cue_radius, ctx.target_radius
+    ghost_offset = ctx.ghost_offset
+    manual_pocket_idx = ctx.manual_pocket_idx
     # 瞄准方案：自动模式与 snooker.choose_target 使用同一套路线排序。
     rail_inset = max(0.0, float(getattr(cfg, "rail_inset_ratio", 1.0)) * r)
     pocket_clearance = 1.35 * r
@@ -749,7 +968,10 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
                 if k.valid and not k.blocked:
                     plans.append(k)
                     break
-        shot = physics.best_shot(plans, W) if plans else None
+        shot = (physics.best_shot(plans, W, table_height=float(H),
+                                  pocket_radius=cfg.pocket_accept_ratio * r,
+                                  ball_radius=r, pockets=pockets_t)
+                if plans else None)
     else:
         shot = None
         plans = physics.plan_shots(cue_t, target_t, pockets_t, r, W, H,
@@ -779,7 +1001,10 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
                     "label": s.label,
                     "cut_deg": s.cut_deg,
                     "total": s.total,
-                    "score": physics.route_score(s, W),
+                    "score": physics.route_score(
+                        s, W, table_height=float(H),
+                        pocket_radius=cfg.pocket_accept_ratio * r,
+                        ball_radius=r, pockets=pockets_t),
                 }
                 for s in (ranked[:6] if len(plans) > 1 else ranked)
             ]
@@ -789,10 +1014,12 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
         scene["hint"] = "该球暂无直球/解围路线，试试换目标球或袋口"
         return scene
 
-    # 推荐力度（切角补偿：切角越大动量传递越差，等效路程拉长）
+    # 推荐力度（切角补偿 + 库边能量损耗补偿）
     power = physics.power_suggestion(shot.total, W, cfg.power_dref_ratio,
                                      cfg.power_min_pct, cfg.power_curve,
                                      cut_deg=shot.cut_deg,
+                                     rails=len(shot.bounce_points),
+                                     rail_loss=cfg.rail_energy_loss,
                                      gain=float(getattr(cfg, "power_gain", 1.0)),
                                      bias=float(getattr(cfg, "power_bias", 0.0)))
     pidx = pockets_t.index(shot.pocket)
@@ -819,6 +1046,17 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
         segs.append({"pts": [cue_s, ghost_s], "color": "#22c55e", "width": 6})
     segs.append({"pts": [ghost_s, target_s], "color": "#f97316", "width": 5, "dash": True})
     segs.append({"pts": [target_s, pocket_s], "color": "#facc15", "width": 4, "dash": True})
+    # 白球切线轨迹：碰后母球沿切线方向滚动；指向袋口（摔袋）时用红色警示
+    tdir, tfrac = physics.cue_tangent(shot)
+    if tfrac > 0.17:
+        L = physics.clamp(W * 0.55 * (power / 100.0) * tfrac, 0.12 * W, 0.8 * W)
+        end_t = (shot.ghost[0] + tdir[0] * L, shot.ghost[1] + tdir[1] * L)
+        end_s = vision.point_table_to_screen(end_t, Hinv)
+        risk = physics.scratch_risk(shot, r, cfg.pocket_accept_ratio * r,
+                                    pockets_t, max(W, H))
+        segs.append({"pts": [ghost_s, end_s], "width": 3, "dash": True,
+                     "color": "#ef4444" if risk > 0.25 else "#22d3ee",
+                     "label": "白球切线" + ("（摔袋风险！）" if risk > 0.25 else "")})
     scene["segments"] = segs
     scene["ghost"] = {"x": ghost_s[0], "y": ghost_s[1],
                        "r": cue_radius * scale}
@@ -846,8 +1084,49 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
     blocked = "被挡" if shot.blocked else "通畅"
     scene["status"] = (f"袋口{pidx + 1} | {shot.label} {blocked} | 切角 {shot.cut_deg:.0f}° "
                        f"| 力度 {power}%")
-    scene["analysis_ms"] = round((time.perf_counter() - started_at) * 1000.0, 1)
     return scene
+
+
+    return None
+
+
+def analyze(frame: np.ndarray, cfg: config_mod.Config,
+            manual_cue: Optional[physics.Point] = None,
+            manual_target: Optional[physics.Point] = None,
+            manual_pocket_idx: Optional[int] = None,
+            picked_target: Optional[physics.Point] = None,
+            tracker: Optional[vision.TableTracker] = None,
+            prefer_target: Optional[physics.Point] = None,
+            pocket_tracker: Optional[vision.PocketTracker] = None,
+            smooth: Optional[Dict] = None,
+            self_mask: Optional[np.ndarray] = None,
+            ball_tracker: Optional[tracking.BallTracker] = None,
+            table_state: Optional[tracking.TableStateTracker] = None,
+            turn_tracker: Optional[snooker.TurnTracker] = None,
+            captured_at: Optional[float] = None) -> Dict:
+    """一帧 → 场景描述（屏幕坐标，供 Overlay 直接绘制）。"""
+    started_at = time.perf_counter()
+
+    def _stamp_ms(s: Dict) -> Dict:
+        """所有提前返回的 scene 也带上耗时：性能日志不再打出「分析 ?ms」。"""
+        s["analysis_ms"] = round((time.perf_counter() - started_at) * 1000.0, 1)
+        return s
+
+    ctx = _AnalysisContext(
+        frame=frame, cfg=cfg, manual_cue=manual_cue, manual_target=manual_target,
+        manual_pocket_idx=manual_pocket_idx, picked_target=picked_target,
+        tracker=tracker, prefer_target=prefer_target,
+        pocket_tracker=pocket_tracker, smooth=smooth, self_mask=self_mask,
+        ball_tracker=ball_tracker, table_state=table_state,
+        turn_tracker=turn_tracker, captured_at=captured_at)
+    ctx.W, ctx.H = cfg.table_w, cfg.table_h
+    ctx.captured_at = time.monotonic() if captured_at is None else captured_at
+    for _stage in (_stage_find_table, _stage_pockets, _stage_balls,
+                   _stage_scene, _stage_validate, _stage_targets):
+        _scene = _stage(ctx)
+        if _scene is not None:
+            return _stamp_ms(_scene)
+    return _stamp_ms(_stage_plan(ctx))
 
 
 class App:
@@ -881,16 +1160,14 @@ class App:
         self.table_state = tracking.TableStateTracker(cfg)
         self.turn_tracker = snooker.TurnTracker()
         self._last_shot: Optional[Dict] = None     # 上一帧方案（目标/袋口记忆）
-        self._last_segs: Optional[List] = None     # 上一帧瞄准线段（EMA 平滑）
-        self._last_points: Optional[Dict[str, Tuple[float, float]]] = None
         self._last_Hm: Optional[np.ndarray] = None  # 最近一帧 屏幕→台面单应矩阵
         self._smooth_state: Dict = {}              # 台面坐标 EMA 平滑状态（analyze 用）
         self.frame_mask: Optional[np.ndarray] = None   # 截屏时刻的叠加层自绘掩膜
-        self._occl_state: Dict = {}                  # 保留兼容参数，v2 不再学习瞬时 UI
         self._last_packet_sequence = -1
         self._last_analysis_at = 0.0
         self._last_perf_report = 0.0
         self._capture_err: Optional[str] = None
+        self._key_handlers: Optional[Dict[str, Callable[[], None]]] = None
 
     # ---------- 后台线程 ----------
     def _capture_context(self) -> Tuple[Optional[Tuple[int, int, int, int]], int]:
@@ -972,7 +1249,13 @@ class App:
     def _detect_loop(self) -> None:
         while self.running:
             store = getattr(self, "frame_store", None)
-            packet = store.latest() if store is not None else None
+            if store is None:
+                time.sleep(0.1)
+                continue
+            # 等发布通知代替 250Hz 轮询：新帧一到立即分析（延迟↓），
+            # 同时消除检测线程的空转唤醒与 FrameStore 锁竞争。
+            packet = store.wait_for_new(
+                getattr(self, "_last_packet_sequence", -1), timeout=0.05)
             now = time.monotonic()
             analysis_fps = max(1.0, float(getattr(self.cfg, "analysis_fps", 30.0)))
             fresh = packet is not None and packet.sequence != getattr(self, "_last_packet_sequence", -1)
@@ -983,7 +1266,6 @@ class App:
                 # analysis may be busy.  Never attach the current region
                 # origin or tracker state to an older frame.
                 if not self._packet_matches_current(packet):
-                    time.sleep(0.004)
                     continue
                 self._last_analysis_at = now
                 if self.mode == "region":
@@ -992,18 +1274,16 @@ class App:
                 else:
                     try:
                         prefer_t = self._last_shot["target"] if self._last_shot else None
-                        prefer_p = self._last_shot["pocket"] if self._last_shot else None
                         scene = analyze(
-                            packet.frame.copy(), self.cfg,
+                            packet.frame, self.cfg,
                             manual_cue=self.manual_cue, manual_target=self.manual_target,
                             manual_pocket_idx=self.manual_pocket_idx,
                             picked_target=self.picked_target,
                             tracker=self.tracker,
                             pocket_tracker=self.pocket_tracker,
-                            prefer_target=prefer_t, prefer_pocket=prefer_p,
+                            prefer_target=prefer_t,
                             smooth=self._smooth_state,
                             self_mask=packet.self_mask,
-                            occl_state=self._occl_state,
                             ball_tracker=self.ball_tracker,
                             table_state=self.table_state,
                             turn_tracker=self.turn_tracker,
@@ -1049,49 +1329,17 @@ class App:
                                   f"端到端 {scene['latency_ms']}ms | "
                                   f"状态 {scene.get('table_state', '?')}", flush=True)
                     except Exception as e:
-                        # 分析帧失败必须可见：以前静默吞掉，画面空白却
-                        # 查不到日志（如 occl_state 尺寸 TypeError）
+                        # 分析帧失败必须可见：以前静默吞掉，画面空白却查不到日志
                         _warn_once(f"[识别异常] 分析帧失败: {type(e).__name__}: {e}",
-                                   packet.frame)
+                                   packet.frame,
+                                   key=f"analyze_fail:{type(e).__name__}")
                         self.scene = {"status": f"识别异常: {e}", "help": HELP_TEXT}
-            # 高频轻轮询只为取最新帧；真正 CPU 开销在上面的分析步骤。
-            time.sleep(0.004)
-
-    def _smooth_segments(self, scene: Dict) -> None:
-        """统一平滑瞄准线和点位标记，避免线端与十字/接触点错位。"""
-        segs = scene.get("segments")
-        last = self._last_segs
-        if not segs:
-            self._last_segs = None
-            self._last_points = None
-            return
-        if last and len(last) == len(segs):
-            a = 0.55
-            for seg, lseg in zip(segs, last):
-                if (seg.get("color") == lseg.get("color")
-                        and len(seg["pts"]) == len(lseg["pts"])):
-                    seg["pts"] = [
-                        (a * px + (1.0 - a) * lx, a * py + (1.0 - a) * ly)
-                        for (px, py), (lx, ly) in zip(seg["pts"], lseg["pts"])
-                    ]
-        point_keys = ("ghost", "contact", "cue", "target")
-        points = {
-            key: (float(scene[key]["x"]), float(scene[key]["y"]))
-            for key in point_keys if scene.get(key)
-        }
-        previous_points = getattr(self, "_last_points", None)
-        if previous_points:
-            a = 0.55
-            for key, (px, py) in list(points.items()):
-                previous = previous_points.get(key)
-                if previous is not None:
-                    points[key] = (
-                        a * px + (1.0 - a) * previous[0],
-                        a * py + (1.0 - a) * previous[1],
-                    )
-                    scene[key]["x"], scene[key]["y"] = points[key]
-        self._last_points = points
-        self._last_segs = segs
+            elif fresh:
+                # 新帧但未到期（analysis_fps 节流）：睡到到期即可，
+                # 到期后 wait_for_new 立刻返回当前帧，不再额外轮询。
+                time.sleep(max(0.0, min(
+                    0.05,
+                    (1.0 / analysis_fps) - (now - getattr(self, "_last_analysis_at", 0.0)))))
 
     @staticmethod
     def _offset_scene(scene: Dict, dx: float, dy: float) -> None:
@@ -1123,12 +1371,9 @@ class App:
         self.ball_tracker = tracking.BallTracker(self.cfg)
         self.table_state = tracking.TableStateTracker(self.cfg)
         self.turn_tracker = snooker.TurnTracker()
-        self._last_segs = None
-        self._last_points = None
         self._last_shot = None
         self._last_Hm = None
         self._smooth_state = {}
-        self._occl_state = {}
         self._last_packet_sequence = -1
 
     def _auto_region(self, quad: List) -> None:
@@ -1156,111 +1401,161 @@ class App:
         self._reset_tracking()
 
     # ---------- Overlay 交互 ----------
+    # ---------- 按键分发（表驱动：新热键在 _build_key_handlers 注册即可） ----------
+
+    def _build_key_handlers(self) -> Dict[str, Callable[[], None]]:
+        """keysym → 处理函数映射；所有热键行为实现在 _key_* 方法。"""
+        handlers: Dict[str, Callable[[], None]] = {
+            "escape": self.quit,
+            "0": self._key_auto_pocket,
+            "g": self._key_pick_toggle,
+            "m": self._key_manual_mode,
+            "r": self._key_reselect_region,
+            "k": self._key_toggle_kicks,
+            "p": self._key_toggle_auto_pocket,
+            "q": self._key_toggle_turn,
+            "o": self._key_toggle_turn,
+            "x": self._key_toggle_click_through,
+            "t": self._key_toggle_overlay,
+            "b": self._key_toggle_balls,
+            "c": self._redetect,
+            "f12": self._key_dump_state,
+        }
+        for i in range(6):                       # 1-6 手动指定袋口
+            handlers[str(i + 1)] = (
+                lambda idx=i: self._key_select_pocket(idx))
+        return handlers
+
     def on_key(self, keysym: str) -> None:
-        cfg = self.cfg
-        if keysym == "escape":
-            self.quit()
-        elif keysym in {"1", "2", "3", "4", "5", "6"}:
-            cfg.selected_pocket = int(keysym) - 1
-            cfg.auto_pocket = False
-            cfg.save()
-            self._redetect()
-        elif keysym == "0":
-            cfg.selected_pocket = -1
-            cfg.auto_pocket = True
-            cfg.save()
-            self._redetect()
-        elif keysym == "g":
-            # 点选目标：点击哪颗球就立即算哪颗的击球方案（母球/袋口自动）
-            self.pick_mode = not self.pick_mode
-            if self.pick_mode:
-                self._set_click_through(False)
-                if self.overlay:
-                    self.overlay.begin_manual()
-                self.scene["hint"] = "点选目标：点击要打的球（母球/袋口自动选），再按 G 取消"
-            else:
-                self.picked_target = None
-                if self.overlay:
-                    self.overlay.stop_manual()
-                self._set_click_through(True)
-            self._redetect()
-        elif keysym == "m":
-            entering = self.mode != "manual"
-            self.mode = "manual" if entering else "auto"
-            self.manual_cue = self.manual_target = None
-            self.manual_pocket_idx = None
-            # transparentcolor 透明区收不到 tk 鼠标事件，手动录入的点击
-            # 由 overlay 的 GetCursorPos 轮询捕获（与 R 键框选同机制）
-            if self.overlay:
-                if entering:
-                    self.overlay.begin_manual()
-                else:
-                    self.overlay.stop_manual()
-            self._set_click_through(self.mode != "manual")
-            self.scene["hint"] = ("手动录入：依次点击 母球 → 目标球 → 袋口" if self.mode == "manual"
-                                  else "")
-            self._redetect()
-        elif keysym == "r":
-            # 重新框选必须脱离旧捕获区域，否则旧区域越界/错位时，
-            # 新框选完成后仍可能继续截取错误位置。R 模式始终从全屏开始。
-            old_region = self.region or self.cfg.capture_region
-            self.region = None
-            self.cfg.capture_region = None
-            self._auto_region_enabled = False
-            self._advance_capture_generation()
-            print(f"[框选] 进入全屏选择，清除旧区域: {old_region}", flush=True)
-            # 即使原本就是全屏模式，也要丢弃旧四边形和旧瞄准线；否则
-            # 框选期间用户会看到上一套坐标系的白色边框仍在漂移。
-            self._reset_tracking()
-            try:
-                self.cfg.save()
-            except OSError as exc:
-                print(f"[框选] 无法保存全屏捕获状态: {exc}", flush=True)
-            self.mode = "region"
+        handlers = getattr(self, "_key_handlers", None)
+        if handlers is None:                    # 惰性构建（测试会轻量构造 App）
+            handlers = self._key_handlers = self._build_key_handlers()
+        handler = handlers.get(keysym)
+        if handler is not None:
+            handler()
+
+    def _key_select_pocket(self, idx: int) -> None:
+        """1-6：手动指定袋口，关闭自动选袋。"""
+        self.cfg.selected_pocket = idx
+        self.cfg.auto_pocket = False
+        self.cfg.save()
+        self._redetect()
+
+    def _key_auto_pocket(self) -> None:
+        """0：恢复自动选袋。"""
+        self.cfg.selected_pocket = -1
+        self.cfg.auto_pocket = True
+        self.cfg.save()
+        self._redetect()
+
+    def _key_pick_toggle(self) -> None:
+        """G：点选目标开关——点哪颗球立即算哪颗的方案（母球/袋口自动）。"""
+        self.pick_mode = not self.pick_mode
+        if self.pick_mode:
             self._set_click_through(False)
             if self.overlay:
-                self.overlay.begin_region()
-            self.scene = {
-                "status": "等待框选球桌区域",
-                "hint": "已切换全屏捕获：框选绿色台面（可稍大一点），按住左键拖到对角松开",
-                "help": HELP_TEXT,
-            }
-        elif keysym == "k":
-            cfg.allow_kicks = not cfg.allow_kicks
-            cfg.save()
-            self._redetect()
-        elif keysym == "p":
-            cfg.auto_pocket = not cfg.auto_pocket
-            cfg.selected_pocket = -1
-            cfg.save()
-            self._redetect()
-        elif keysym in {"q", "o"}:
-            # Q 是红球阶段的快速入口；O 保留为旧版本兼容热键。
-            # 换手/失误无法可靠地由单帧视觉判断，允许用户显式切换当前球权。
-            balls = [type("BallRef", (), {"label": b.get("label")})()
-                     for b in self.scene.get("balls", [])]
-            ball_on = self.turn_tracker.toggle_red_color(balls)
-            self.scene["hint"] = ("规则状态：打红球（Q 可切换为彩球）" if ball_on == "red"
-                                  else "规则状态：红球后选彩球（Q 可切回红球）"
-                                  if ball_on == "color"
-                                  else "规则状态：清彩顺序 黄→绿→棕→蓝→粉→黑")
-            self._redetect()
-        elif keysym == "x":
-            on = not getattr(self.overlay, "_click_through", False)
-            self._set_click_through(on)
-        elif keysym == "t":
+                self.overlay.begin_manual()
+            self.scene["hint"] = "点选目标：点击要打的球（母球/袋口自动选），再按 G 取消"
+        else:
+            self.picked_target = None
             if self.overlay:
-                self.overlay.toggle_visible()
-        elif keysym == "b":
-            if self.overlay:
-                on = self.overlay.toggle_balls()
-                self.scene["hint"] = "全球标注：开" if on else "极简模式：仅母球/目标球"
-                self._redetect()
-        elif keysym == "c":
+                self.overlay.stop_manual()
+            self._set_click_through(True)
+        self._redetect()
+
+    def _key_manual_mode(self) -> None:
+        """M：手动录入模式开关（依次点击 母球 → 目标球 → 袋口）。"""
+        entering = self.mode != "manual"
+        self.mode = "manual" if entering else "auto"
+        self.manual_cue = self.manual_target = None
+        self.manual_pocket_idx = None
+        # transparentcolor 透明区收不到 tk 鼠标事件，手动录入的点击
+        # 由 overlay 的 GetCursorPos 轮询捕获（与 R 键框选同机制）
+        if self.overlay:
+            if entering:
+                self.overlay.begin_manual()
+            else:
+                self.overlay.stop_manual()
+        self._set_click_through(self.mode != "manual")
+        self.scene["hint"] = ("手动录入：依次点击 母球 → 目标球 → 袋口" if self.mode == "manual"
+                              else "")
+        self._redetect()
+
+    def _key_reselect_region(self) -> None:
+        """R：重新框选捕获区域（始终从全屏开始，脱离旧坐标系）。"""
+        # 重新框选必须脱离旧捕获区域，否则旧区域越界/错位时，
+        # 新框选完成后仍可能继续截取错误位置。R 模式始终从全屏开始。
+        old_region = self.region or self.cfg.capture_region
+        self.region = None
+        self.cfg.capture_region = None
+        self._auto_region_enabled = False
+        self._advance_capture_generation()
+        print(f"[框选] 进入全屏选择，清除旧区域: {old_region}", flush=True)
+        # 即使原本就是全屏模式，也要丢弃旧四边形和旧瞄准线；否则
+        # 框选期间用户会看到上一套坐标系的白色边框仍在漂移。
+        self._reset_tracking()
+        try:
+            self.cfg.save()
+        except OSError as exc:
+            print(f"[框选] 无法保存全屏捕获状态: {exc}", flush=True)
+        self.mode = "region"
+        self._set_click_through(False)
+        if self.overlay:
+            self.overlay.begin_region()
+        self.scene = {
+            "status": "等待框选球桌区域",
+            "hint": "已切换全屏捕获：框选绿色台面（可稍大一点），按住左键拖到对角松开",
+            "help": HELP_TEXT,
+        }
+
+    def _key_toggle_kicks(self) -> None:
+        """K：允许/禁止库边解球。"""
+        self.cfg.allow_kicks = not self.cfg.allow_kicks
+        self.cfg.save()
+        self._redetect()
+
+    def _key_toggle_auto_pocket(self) -> None:
+        """P：自动/手动选袋开关。"""
+        self.cfg.auto_pocket = not self.cfg.auto_pocket
+        self.cfg.selected_pocket = -1
+        self.cfg.save()
+        self._redetect()
+
+    def _key_toggle_turn(self) -> None:
+        """Q/O：红球阶段手动切换红/彩球权（O 为旧版兼容热键）。
+
+        换手/失误无法可靠地由单帧视觉判断，允许用户显式切换当前球权。
+        """
+        balls = [type("BallRef", (), {"label": b.get("label")})()
+                 for b in self.scene.get("balls", [])]
+        ball_on = self.turn_tracker.toggle_red_color(balls)
+        self.scene["hint"] = ("规则状态：打红球（Q 可切换为彩球）" if ball_on == "red"
+                              else "规则状态：红球后选彩球（Q 可切回红球）"
+                              if ball_on == "color"
+                              else "规则状态：清彩顺序 黄→绿→棕→蓝→粉→黑")
+        self._redetect()
+
+    def _key_toggle_click_through(self) -> None:
+        """X：点击穿透开关。"""
+        on = not getattr(self.overlay, "_click_through", False)
+        self._set_click_through(on)
+
+    def _key_toggle_overlay(self) -> None:
+        """T：显示/隐藏瞄准层。"""
+        if self.overlay:
+            self.overlay.toggle_visible()
+
+    def _key_toggle_balls(self) -> None:
+        """B：全球标注 / 极简模式切换。"""
+        if self.overlay:
+            on = self.overlay.toggle_balls()
+            self.scene["hint"] = "全球标注：开" if on else "极简模式：仅母球/目标球"
             self._redetect()
-        elif keysym == "f12":
-            print(f"[状态] scene={self.scene.get('status')} | region={self.region} "
-                  f"| mode={self.mode} | last_shot={self._last_shot is not None}", flush=True)
+
+    def _key_dump_state(self) -> None:
+        """F12：打印当前运行状态。"""
+        print(f"[状态] scene={self.scene.get('status')} | region={self.region} "
+              f"| mode={self.mode} | last_shot={self._last_shot is not None}", flush=True)
 
     def _set_click_through(self, on: bool) -> None:
         if self.overlay:

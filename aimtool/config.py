@@ -27,7 +27,6 @@ class Config:
     capture_region: Optional[List[int]] = None
     capture_fps: float = 60.0
     analysis_fps: float = 30.0            # 最多分析多少张最新帧；绝不排队处理旧帧
-    detect_every_frames: int = 1          # 兼容旧配置字段；v2 管线不再使用它
     analysis_scale: float = 0.85          # 相对屏幕台面宽度的分析分辨率
     analysis_min_width: int = 720
     analysis_max_width: int = 960
@@ -74,7 +73,6 @@ class Config:
     # 台面锁定：首帧检测后锁定四边形，周期性重检防窗口移动
     table_lock: bool = True
     table_recheck_frames: int = 30        # 每 N 帧重检一次四边形
-    table_smooth_alpha: float = 0.55      # 兼容旧配置；当前不平滑锁定框
     table_max_miss: int = 5               # 连续检测失败 N 帧后强制解锁重检
     table_recheck_max_shift: float = 7.0  # 单次重检允许的像素偏移；更大需连续确认
     table_stable_deadband: float = 2.0    # 移动候选的刚性/绝对位置容差
@@ -114,6 +112,8 @@ class Config:
     rail_inset_ratio: float = 1.0         # 库边碰撞以球心轨迹计，默认离台呢边 r
     power_gain: float = 1.0
     power_bias: float = 0.0
+    rail_energy_loss: float = 0.22        # 每库能量损耗：等效路程增幅 (1+0.22×库数)
+    pocket_accept_ratio: float = 1.45     # 袋口可接受半径 / 球半径（评分用）
 
     def save(self) -> None:
         # 检测线程与 UI 线程都可能触发保存，加锁防并发写坏文件
@@ -143,7 +143,6 @@ class Config:
             if version < 2:
                 cfg.pipeline_version = 2
                 cfg.capture_fps = max(60.0, float(cfg.capture_fps))
-                cfg.detect_every_frames = 1
                 migrated = True
             if version < 3:
                 if "analysis_scale" not in data or float(data.get("analysis_scale", 1.0)) == 1.0:

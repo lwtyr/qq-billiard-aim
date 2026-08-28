@@ -22,8 +22,31 @@ _use_gdi = sys.platform == "win32"
 
 # ---------- Windows GDI 直截（不含分层窗口） ----------
 
+def _gdi_release() -> None:
+    """释放当前线程缓存的 GDI 截屏资源（尺寸变化/失败/回退时）。"""
+    st = getattr(_local, "gdi", None)
+    if st is None:
+        return
+    mem_dc, bmp = st[0], st[1]
+    import ctypes
+    gdi32 = ctypes.windll.gdi32
+    try:
+        if mem_dc:
+            gdi32.DeleteDC(mem_dc)
+    finally:
+        if bmp:
+            gdi32.DeleteObject(bmp)
+    _local.gdi = None
+
+
 def _gdi_grab(x: int, y: int, w: int, h: int) -> np.ndarray:
-    """BitBlt 截取屏幕区域，返回 BGR uint8。不捕获分层窗口。"""
+    """BitBlt 截取屏幕区域，返回 BGR uint8。不捕获分层窗口。
+
+    mem DC / 兼容位图 / 行缓冲按（线程, 尺寸）缓存复用：每帧
+    Create/Delete CompatibleDC+Bitmap+buffer 的内核对象与分配
+    开销曾是截屏线程的固定成本；分辨率不变时全部复用，仅在
+    尺寸变化或失败时重建。
+    """
     import ctypes
     from ctypes import wintypes
 
@@ -55,23 +78,25 @@ def _gdi_grab(x: int, y: int, w: int, h: int) -> np.ndarray:
     hdc_screen = user32.GetDC(None)
     if not hdc_screen:
         raise OSError("GetDC(None) failed")
-    mem_dc = gdi32.CreateCompatibleDC(hdc_screen)
-    bmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
-    if not mem_dc or not bmp:
-        if mem_dc:
-            gdi32.DeleteDC(mem_dc)
-        if bmp:
-            gdi32.DeleteObject(bmp)
-        user32.ReleaseDC(None, hdc_screen)
-        raise OSError("CreateCompatibleDC/CreateCompatibleBitmap failed")
-    old_bmp = None
     try:
-        old_bmp = gdi32.SelectObject(mem_dc, bmp)
-        if not old_bmp:
-            raise OSError("SelectObject failed")
-        # 仅 SRCCOPY：不含 CAPTUREBLT → 不捕获分层窗口（overlay）
-        if not gdi32.BitBlt(mem_dc, 0, 0, w, h, hdc_screen, x, y, 0x00CC0020):
-            raise OSError("BitBlt failed")
+        st = getattr(_local, "gdi", None)
+        if st is not None and (st[2] != w or st[3] != h):
+            _gdi_release()
+            st = None
+        if st is None:
+            mem_dc = gdi32.CreateCompatibleDC(hdc_screen)
+            bmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+            if not mem_dc or not bmp:
+                if mem_dc:
+                    gdi32.DeleteDC(mem_dc)
+                if bmp:
+                    gdi32.DeleteObject(bmp)
+                raise OSError(
+                    "CreateCompatibleDC/CreateCompatibleBitmap failed")
+            st = (mem_dc, bmp, w, h,
+                  ctypes.create_string_buffer(w * h * 4))
+            _local.gdi = st
+        mem_dc, bmp, _, _, buf = st
 
         class BITMAPINFOHEADER(ctypes.Structure):
             _fields_ = [("biSize", wintypes.DWORD),
@@ -99,24 +124,32 @@ def _gdi_grab(x: int, y: int, w: int, h: int) -> np.ndarray:
         bmi.biBitCount = 32
         bmi.biCompression = 0        # BI_RGB
 
-        # GetDIBits 要求目标位图不能仍被选入 DC。旧实现把
-        # SelectObject 放到了 finally，导致这里在 Windows 上经常返回 0，
-        # 随后 grab() 永久退回 mss；mss 又可能把分层 Overlay 一起截进来，
-        # 形成「Overlay -> 识别 -> Overlay」的自反馈抖动。
-        if not gdi32.SelectObject(mem_dc, old_bmp):
-            raise OSError("restore SelectObject failed")
-        old_bmp = None
+        # 位图只在 BitBlt 期间选入 DC：GetDIBits 要求目标位图不能仍被
+        # 选入 DC。旧实现把恢复放到 finally，在 Windows 上 GetDIBits
+        # 经常返回 0，grab() 永久退回 mss；mss 又可能把分层 Overlay
+        # 一起截进来，形成「Overlay -> 识别 -> Overlay」的自反馈抖动。
+        old_bmp = gdi32.SelectObject(mem_dc, bmp)
+        if not old_bmp:
+            raise OSError("SelectObject failed")
+        try:
+            # 仅 SRCCOPY：不含 CAPTUREBLT → 不捕获分层窗口（overlay）
+            if not gdi32.BitBlt(mem_dc, 0, 0, w, h, hdc_screen, x, y,
+                                0x00CC0020):
+                raise OSError("BitBlt failed")
+        finally:
+            gdi32.SelectObject(mem_dc, old_bmp)
 
-        buf = ctypes.create_string_buffer(w * h * 4)
         if gdi32.GetDIBits(mem_dc, bmp, 0, h, buf, ctypes.byref(bmi), 0) <= 0:
             raise OSError("GetDIBits failed")
         frame = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
+        # 尾部 copy 与缓存行缓冲解耦并丢弃 alpha：每帧返回全新数组，
+        # 帧所有权归发布者（下游无需再防御性 copy）。
         return frame[:, :, :3].copy()   # BGRA → BGR
+    except Exception:
+        # 缓存状态可疑：释放当前线程的全部 GDI 缓存，下次重建。
+        _gdi_release()
+        raise
     finally:
-        if old_bmp:
-            gdi32.SelectObject(mem_dc, old_bmp)
-        gdi32.DeleteObject(bmp)
-        gdi32.DeleteDC(mem_dc)
         user32.ReleaseDC(None, hdc_screen)
 
 

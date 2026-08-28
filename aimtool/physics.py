@@ -378,7 +378,8 @@ def power_suggestion(total: float, table_width: float,
                      dref_ratio: float = 2.2, min_pct: float = 10.0,
                      curve: float = 1.0, max_pct: float = 100.0,
                      cut_deg: float = 0.0, gain: float = 1.0,
-                     bias: float = 0.0) -> int:
+                     bias: float = 0.0, rails: int = 0,
+                     rail_loss: float = 0.22) -> int:
     """总路程 → 推荐力度 0-100。
 
     dref_ratio：把「多少倍台面宽度」视为满杆距离（默认 2.2 倍）。
@@ -387,11 +388,15 @@ def power_suggestion(total: float, table_width: float,
     cut_deg：切角补偿。切角越大，母球传给目标球的动量份额越少
     （≈cos²cut），需要更高杆速；等效路程按 1/cos(cut) 放大
     （切角≤30° 不补偿，≥80° 按上限 1/0.25=4 倍封顶）。
+
+    rails/rail_loss：库边能量损耗补偿。每次反弹损失一部分动能
+    （实测 2D 桌球每库约损失 20-25% 速度），等效路程按
+    (1 + rail_loss × 库数) 放大，与切角补偿相乘。
     """
-    eff = total
+    eff = total * (1.0 + rail_loss * max(0, rails))
     if cut_deg > 30.0:
         c = max(math.cos(math.radians(min(cut_deg, 80.0))), 0.25)
-        eff = total / c
+        eff = eff / c          # 注意：在库边补偿后的 eff 基础上再放大，不能用 total 覆盖
     dref = dref_ratio * table_width
     raw = clamp(eff / dref, 0.0, 1.0)
     pct = bias + gain * (min_pct + (max_pct - min_pct) * (raw ** curve))
@@ -461,14 +466,83 @@ def plan_shots(cue: Point, target: Point, pockets: Sequence[Point], r: float,
     return plans
 
 
+def cue_tangent(shot: Shot) -> Tuple[Point, float]:
+    """母球碰撞后的切线方向（单位向量）与切向速度份额 sin(cut)。
+
+    碰撞瞬间母球速度分解：沿球心连线（传给目标球）+ 切线分量
+    （母球自己带走）。切线方向 = aim 方向去掉法向分量。近正碰
+    （sin(cut) 小）时切线分量趋近 0，母球基本留在原地，不画。
+    库边解球用最后一库反弹点 → 鬼球方向作为碰撞时进杆方向。
+    """
+    if shot.bounce_points:
+        bx, by = shot.bounce_points[-1]
+        ix, iy = shot.ghost[0] - bx, shot.ghost[1] - by
+    else:
+        ix, iy = shot.aim_dir
+    ilen = math.hypot(ix, iy)
+    if ilen < 1e-9:
+        return (0.0, 0.0), 0.0
+    ix, iy = ix / ilen, iy / ilen
+    # 法线 = 鬼球 → 目标球（球心连线），直球时 ≈ 袋口 → 鬼球方向
+    nx, ny = shot.ghost[0] - shot.pocket[0], shot.ghost[1] - shot.pocket[1]
+    nlen = math.hypot(nx, ny)
+    if nlen < 1e-9:
+        return (0.0, 0.0), 0.0
+    nx, ny = nx / nlen, ny / nlen
+    tx = ix - (ix * nx + iy * ny) * nx
+    ty = iy - (ix * nx + iy * ny) * ny
+    tn = math.hypot(tx, ty)
+    if tn < 1e-9:
+        return (0.0, 0.0), 0.0
+    return (tx / tn, ty / tn), tn
+
+
+def scratch_risk(shot: Shot, ball_radius: float, pocket_radius: float,
+                 pockets: Sequence[Point], span: float) -> float:
+    """母球沿切线滚动后的摔袋风险 0..1（0=无风险）。
+
+    从鬼球沿切线方向射射线，检查各袋口中与射线的距离；同时要求
+    袋口在切线前方且距离不超过 1.2 倍台面跨度（太远的袋口母球
+    到不了）。目标袋本身权重更高（白球跟进目标袋最常见）。
+    """
+    tdir, tfrac = cue_tangent(shot)
+    if tfrac < 0.17:
+        return 0.0
+    gx, gy = shot.ghost
+    tx, ty = tdir
+    reach = pocket_radius + 0.3 * ball_radius
+    best = 0.0
+    for (cx, cy) in pockets:
+        sx, sy = cx - gx, cy - gy
+        s = sx * tx + sy * ty          # 沿切线前进距离
+        if s <= 0.0 or s > 1.2 * span:
+            continue
+        d = abs(sx * ty - sy * tx)     # 到射线的垂距
+        if d >= reach:
+            continue
+        risk = (1.0 - d / reach) * (1.0 - 0.45 * min(1.0, s / span))
+        if (cx, cy) == tuple(shot.pocket):
+            risk *= 1.35
+        best = max(best, min(1.0, risk))
+    return float(best)
+
+
 def route_score(shot: Shot, table_width: float,
-                max_cut_deg: float = MAX_CUT_DEG) -> float:
+                max_cut_deg: float = MAX_CUT_DEG,
+                table_height: Optional[float] = None,
+                pocket_radius: Optional[float] = None,
+                ball_radius: Optional[float] = None,
+                pockets: Optional[Sequence[Point]] = None) -> float:
     """估计一条可行路线的失误风险，分数越低越适合自动推荐。
 
     ``plan_shots`` 保留「直球/一库/两库」的传统分组顺序，方便诊断和
     兼容旧调用；自动选择则不能只看总路程。薄切虽然距离短，但有效袋口
     宽度和容错都很小；库边路线也应随反弹次数增加风险。这里把切角和
     反弹数转成可比较的惩罚，不改变几何有效性判断。
+
+    可选精度项（传入 table_height/pocket_radius/pockets 后启用）：
+    - 袋口入射角：目标球接近方向偏离袋口中线越多，有效接受宽度越窄；
+    - 摔袋风险：母球切线指向某袋口时加重大惩罚（白球跟进=送分）。
     """
     if not shot.valid or shot.blocked:
         return float("inf")
@@ -477,17 +551,42 @@ def route_score(shot: Shot, table_width: float,
     # 切角风险在 60 度以后明显上升；库边每多一库都会引入反弹误差。
     cut_penalty = table_width * 0.60 * (cut_ratio ** 2.4)
     rail_penalty = table_width * (0.16 * rails + 0.08 * rails * rails)
-    return float(shot.total + cut_penalty + rail_penalty)
+    score = shot.total + cut_penalty + rail_penalty
+    if table_height and pocket_radius and ball_radius:
+        # 袋口入射角惩罚：接近方向偏离袋口中线 → 有效接受宽度收窄。
+        # 口法向取「台心指向袋口」（开口朝向）：合法击球的接近方向
+        # （鬼球→袋口）应与开口方向大致同向 → cos_in 接近 1；
+        # 贴着库边斜着抹进去的球接近方向与开口近乎垂直 → cos_in 接近 0。
+        gx, gy = shot.ghost
+        px, py = shot.pocket
+        ax, ay = px - gx, py - gy
+        na = math.hypot(ax, ay)
+        nx, ny = (px - table_width / 2.0, py - table_height / 2.0)
+        nn = math.hypot(nx, ny)
+        if na > 1e-6 and nn > 1e-6:
+            cos_in = clamp((ax * nx + ay * ny) / (na * nn), 0.0, 1.0)
+            full = 2.0 * max(1e-6, pocket_radius - ball_radius)
+            narrow = 1.0 - cos_in
+            # 窄到一半以上才明显罚，避免与切角惩罚重复计账
+            if narrow > 0.5:
+                score += table_width * 0.45 * ((narrow - 0.5) * 2.0) ** 1.5
+        # 白球摔袋风险：切线指向袋口 = 送给对手机会
+        if pockets:
+            risk = scratch_risk(shot, ball_radius, pocket_radius,
+                                pockets, max(table_width, table_height))
+            score += table_width * 1.1 * risk
+    return float(score)
 
 
 def rank_shots(plans: Sequence[Shot], table_width: float,
-               max_cut_deg: float = MAX_CUT_DEG) -> List[Shot]:
+               max_cut_deg: float = MAX_CUT_DEG, **kw) -> List[Shot]:
     """按自动推荐质量排序，稳定保留原列表的顺序作为平局顺序。"""
-    return sorted(plans, key=lambda s: route_score(s, table_width, max_cut_deg))
+    return sorted(plans, key=lambda s: route_score(s, table_width,
+                                                   max_cut_deg, **kw))
 
 
 def best_shot(plans: Sequence[Shot], table_width: float,
-              max_cut_deg: float = MAX_CUT_DEG) -> Optional[Shot]:
+              max_cut_deg: float = MAX_CUT_DEG, **kw) -> Optional[Shot]:
     """从已验证的候选路线中选最适合实际击打的一条。"""
-    ranked = rank_shots(plans, table_width, max_cut_deg)
+    ranked = rank_shots(plans, table_width, max_cut_deg, **kw)
     return ranked[0] if ranked else None

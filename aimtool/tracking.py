@@ -38,14 +38,14 @@ class FrameStore:
     """Thread-safe latest-frame handoff; publishing replaces, never queues."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._cond = threading.Condition()
         self._sequence = 0
         self._latest: Optional[FramePacket] = None
 
     def publish(self, frame: np.ndarray, self_mask: Optional[np.ndarray],
                 capture_region: Optional[Iterable[int]] = None,
                 capture_generation: int = 0) -> FramePacket:
-        with self._lock:
+        with self._cond:
             self._sequence += 1
             region = (None if capture_region is None
                       else tuple(int(value) for value in capture_region))
@@ -53,11 +53,26 @@ class FrameStore:
                 self._sequence, time.monotonic(), frame, self_mask,
                 region, int(capture_generation))
             self._latest = packet
+            self._cond.notify_all()
             return packet
 
     def latest(self) -> Optional[FramePacket]:
-        with self._lock:
+        with self._cond:
             return self._latest
+
+    def wait_for_new(self, last_sequence: int,
+                     timeout: float = 0.05) -> Optional[FramePacket]:
+        """阻塞直到出现比 last_sequence 更新的帧，或超时返回当前帧。
+
+        代替检测线程的 250Hz 轮询：发布即唤醒（分析延迟↓），
+        无新帧时线程真正挂起（空转唤醒与锁竞争归零）。
+        """
+        with self._cond:
+            packet = self._latest
+            if packet is None or packet.sequence == last_sequence:
+                self._cond.wait(timeout)
+                packet = self._latest
+            return packet
 
 
 @dataclass

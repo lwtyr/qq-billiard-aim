@@ -31,67 +31,62 @@ Point = Tuple[float, float]
 TABLE_W = 2000.0
 TABLE_H = 1000.0
 
-# ---------- 斯诺克球色（HSV 判定，向量化版本见 detect_balls） ----------
+# ---------- 斯诺克球色（唯一判定来源：BALL_HSV_RULES 表） ----------
 
-def _is_white(h: int, s: int, v: int) -> bool:
-    # 白色：高亮度（v>150 排除去背景后的灰色残留 128） + 低饱和（s<80 容忍轻微染色）。
-    # 彩球高光同为白色但面积小，由 _split_blobs 的面积/圆度过滤排除。
-    return s < 80 and v > 150
+# 每球 HSV 判定规则：h 允许段列表（None=不限制；uint8 色相 0-179）
+# + (s_lo, s_hi) + (v_lo, v_hi) 闭区间。标量判色（classify_pixel）与
+# 全帧向量化掩膜（_mask_for_label）都由这张表生成，改动阈值只改这里。
+BALL_HSV_RULES: Dict[str, Tuple[Optional[List[Tuple[int, int]]],
+                                 Tuple[int, int], Tuple[int, int]]] = {
+    "白球": (None, (0, 79), (151, 255)),
+    "黑球": (None, (0, 129), (0, 61)),
+    "红球": ([(0, 10), (170, 179)], (131, 255), (121, 255)),
+    "粉球": ([(150, 176)], (71, 255), (161, 255)),
+    "黄球": ([(18, 45)], (111, 255), (191, 255)),
+    "绿球": ([(45, 100)], (181, 255), (91, 255)),
+    "棕球": ([(8, 32)], (71, 255), (40, 165)),
+    "蓝球": ([(100, 130)], (141, 255), (81, 255)),
+}
+# 白色：高亮度（v>150 排除去背景后的灰色残留 128）+ 低饱和（s<80 容忍轻微染色）。
+# 彩球高光同为白色但面积小，由 _split_blobs 的面积/圆度过滤排除。
+# 黑色：纯黑球 v<62，收紧排除库边/阴影/UI 深色（v 50-120 常见）；真实黑球 v≈45；
+# 袋口已由 clean_background 涂灰（v=128），不在此范围。
+# 绿色：鲜绿球高饱和（s>180）；真实台面饱和 ~155 且会被去背景涂灰，收紧阈值
+# 防止台面/UI 绿色未涂净时误入绿球掩膜。判据优先级见 PRIORITY（同色相区域
+# 红/粉、棕/黄先判更特异的）。
 
-
-def _is_black(h: int, s: int, v: int) -> bool:
-    # 纯黑球：v<62。收紧排除库边/阴影/UI 深色（v 50-120 常见）被当黑球。
-    # 真实黑球 v≈45；袋口已由 clean_background 涂灰（v=128），不在此范围。
-    return v < 62 and s < 130
-
-
-def _is_red(h: int, s: int, v: int) -> bool:
-    return (h <= 10 or h >= 170) and s > 130 and v > 120
-
-
-def _is_pink(h: int, s: int, v: int) -> bool:
-    return 150 <= h <= 176 and s > 70 and v > 160
-
-
-def _is_yellow(h: int, s: int, v: int) -> bool:
-    return 18 <= h <= 45 and s > 110 and v > 190
-
-
-def _is_green(h: int, s: int, v: int) -> bool:
-    # 鲜绿球：高饱和（s>180）。真实台面饱和 ~155 且会被去背景涂灰，
-    # 但收紧阈值可防止台面/UI 绿色未涂净时误入绿球掩膜。
-    return 45 <= h <= 100 and s > 180 and v > 90
-
-
-def _is_brown(h: int, s: int, v: int) -> bool:
-    return 8 <= h <= 32 and s > 70 and 40 <= v <= 165
-
-
-def _is_blue(h: int, s: int, v: int) -> bool:
-    return 100 <= h <= 130 and s > 140 and v > 80
-
-
-# 判定优先级：同色相区域（红/粉、棕/黄）先判更特异的
-# 参考色为 BGR（cv2 约定），仅用于显示/调试，判定逻辑看函数。
-BALL_PALETTE: Dict[str, Tuple[Tuple[int, int, int], object]] = {
-    "白球": ((255, 255, 255), _is_white),
-    "黑球": ((40, 40, 40), _is_black),
-    "红球": ((0, 0, 255), _is_red),
-    "粉球": ((180, 105, 255), _is_pink),
-    "黄球": ((40, 200, 255), _is_yellow),
-    "绿球": ((0, 160, 30), _is_green),
-    "棕球": ((30, 80, 150), _is_brown),
-    "蓝球": ((255, 0, 0), _is_blue),
+# 参考色为 BGR（cv2 约定），仅用于显示/调试，判定逻辑看 BALL_HSV_RULES。
+BALL_PALETTE: Dict[str, Tuple[int, int, int]] = {
+    "白球": (255, 255, 255),
+    "黑球": (40, 40, 40),
+    "红球": (0, 0, 255),
+    "粉球": (180, 105, 255),
+    "黄球": (40, 200, 255),
+    "绿球": (0, 160, 30),
+    "棕球": (30, 80, 150),
+    "蓝球": (255, 0, 0),
 }
 PRIORITY = ["白球", "黑球", "红球", "粉球", "黄球", "绿球", "棕球", "蓝球"]
+
+
+def _match_rule(label: str, h: int, s: int, v: int) -> bool:
+    """标量版规则匹配（单像素判色用）。"""
+    rule = BALL_HSV_RULES.get(label)
+    if rule is None:
+        return False
+    h_ranges, (s_lo, s_hi), (v_lo, v_hi) = rule
+    if not (s_lo <= s <= s_hi and v_lo <= v <= v_hi):
+        return False
+    if h_ranges is None:
+        return True
+    return any(lo <= h <= hi for (lo, hi) in h_ranges)
 
 
 def classify_pixel(hsv_px: np.ndarray) -> str:
     """单像素（或中心均值）按优先级判色。"""
     h, s, v = int(hsv_px[0]), int(hsv_px[1]), int(hsv_px[2])
     for label in PRIORITY:
-        fn = BALL_PALETTE[label][1]
-        if fn(h, s, v):
+        if _match_rule(label, h, s, v):
             return label
     return "未知"
 
@@ -117,44 +112,6 @@ def order_corners(pts: np.ndarray) -> np.ndarray:
     tr = pts[np.argmin(diff)]
     bl = pts[np.argmax(diff)]
     return np.array([tl, tr, br, bl], dtype=np.float32)
-
-
-def _ransac_lines(pts: np.ndarray, n_lines: int = 4, iters: int = 300,
-                  thresh: float = 2.5, min_inliers: int = 40) -> List[Tuple[float, float, float, float]]:
-    """RANSAC 迭代从轮廓点提取 n_lines 条直线（每次移除 inliers）。
-
-    返回 [(vx, vy, x0, y0), ...]：单位方向向量 + 线上一点。对矩形四条边
-    非常稳：每条边 ~1900 个 inlier 点，抗锯齿/噪声/球凸起。
-    """
-    rng = np.random.default_rng(0)
-    remaining = pts.astype(np.float64)
-    lines: List[Tuple[float, float, float, float]] = []
-    for _ in range(n_lines):
-        best_inl: Optional[np.ndarray] = None
-        best_n = 0
-        if len(remaining) < min_inliers:
-            break
-        for _ in range(iters):
-            idx = rng.integers(0, len(remaining), 2)
-            p1, p2 = remaining[idx]
-            dv = p2 - p1
-            ln = np.hypot(dv[0], dv[1])
-            if ln < 1e-9:
-                continue
-            dists = np.abs(dv[0] * (remaining[:, 1] - p1[1]) - dv[1] * (remaining[:, 0] - p1[0])) / ln
-            inl = dists < thresh
-            n = int(inl.sum())
-            if n > best_n:
-                best_n = n
-                best_inl = remaining[inl].copy()
-        if best_inl is None or best_n < min_inliers:
-            break
-        vx, vy, x0, y0 = cv2.fitLine(best_inl, cv2.DIST_HUBER, 0, 0.01, 0.01).flatten()
-        lines.append((float(vx), float(vy), float(x0), float(y0)))
-        # 移除该线 inliers
-        dists = np.abs(vx * (remaining[:, 1] - y0) - vy * (remaining[:, 0] - x0))
-        remaining = remaining[dists >= thresh]
-    return lines
 
 
 def _lines_intersection(l1: Tuple[float, float, float, float],
@@ -368,7 +325,10 @@ def point_screen_to_table(pt: Point, H: np.ndarray) -> Point:
     x, y = pt
     denom = H[2, 0] * x + H[2, 1] * y + H[2, 2]
     if abs(denom) < 1e-9:
-        return pt
+        # 单应矩阵退化（H 非法或点落在投影极线上）：
+        # 返回原坐标会让调用方拿到一个"看似台面实则屏幕"的错坐标去算路线，
+        # 必须让调用方显式失败而不是静默错下去。
+        raise ValueError(f"point_screen_to_table: 退化单应（denom={denom:.3g}，pt={pt!r}）")
     sx = (H[0, 0] * x + H[0, 1] * y + H[0, 2]) / denom
     sy = (H[1, 0] * x + H[1, 1] * y + H[1, 2]) / denom
     return (float(sx), float(sy))
@@ -378,7 +338,7 @@ def point_table_to_screen(pt: Point, Hinv: np.ndarray) -> Point:
     x, y = pt
     denom = Hinv[2, 0] * x + Hinv[2, 1] * y + Hinv[2, 2]
     if abs(denom) < 1e-9:
-        return pt
+        raise ValueError(f"point_table_to_screen: 退化单应（denom={denom:.3g}，pt={pt!r}）")
     sx = (Hinv[0, 0] * x + Hinv[0, 1] * y + Hinv[0, 2]) / denom
     sy = (Hinv[1, 0] * x + Hinv[1, 1] * y + Hinv[1, 2]) / denom
     return (float(sx), float(sy))
@@ -431,29 +391,67 @@ def felt_like_mask(hsv: np.ndarray, cfg,
 
 
 def blank_self_mask(frame: np.ndarray, self_mask: Optional[np.ndarray],
-                    cfg) -> None:
+                    cfg) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """把「叠加层自绘像素」填回台呢色，消除自截屏干扰。
 
     全屏顶层透明窗画出的瞄准线会被 BitBlt 截屏一起抓进帧里，遮挡
     检测会把自家的线误判为「弹窗面板」。叠加层每帧登记实际画过的
     像素（drawn_mask），截屏端同步快照、分析前原位填回台呢色，
     识别管线就再也看不到自家画的线/点/面板了。
+
+    返回 (ys, xs, 原像素) 还原信息：_save_bad_frame 写盘前据此把
+    填回的像素恢复成原始画面。否则存下的「原始帧」已被涂成台呢色，
+    诊断时看不到真实遮挡/异常长什么样。
     """
     if self_mask is None or frame is None:
-        return
+        return None
     if self_mask.shape[:2] != frame.shape[:2]:
-        return
-    if not bool(self_mask.any()):
-        return
+        return None
+    mask = self_mask > 0
+    if not bool(mask.any()):
+        return None
+    ys, xs = np.nonzero(mask)
+    restore = (ys, xs, frame[ys, xs].copy())
     fh, fs, fv = estimate_felt_hsv(frame, cfg)
     bgr = cv2.cvtColor(np.uint8([[[fh, fs, fv]]]), cv2.COLOR_HSV2BGR)[0][0]
-    frame[self_mask > 0] = bgr
+    frame[mask] = bgr
+    return restore
 
 
-def _protect_mask(h: np.ndarray, s: np.ndarray, v: np.ndarray,
+def _ball_color_protect(h: Optional[np.ndarray], s: Optional[np.ndarray],
+                         v: Optional[np.ndarray], cfg,
+                         label_masks: Optional[Dict[str, np.ndarray]] = None
+                         ) -> np.ndarray:
+    """所有「确定是球色」的像素（uint8 0/255），不含黑球。
+
+    袋口涂灰时用它保护袋口挂球：红/黄/绿/棕/蓝/粉/白掩膜都不会命中
+    袋洞（洞是暗色），可无条件保护；唯独黑球掩膜与袋洞同色，单独由
+    clean_background 里「亮高光核心膨胀」判定（黑球有高光，洞没有）。
+    """
+    out = np.zeros(h.shape if h is not None else
+                   list(label_masks.values())[0].shape[:2], dtype=np.uint8)
+    for label in PRIORITY:
+        if label == "黑球":
+            continue
+        if label_masks is not None:
+            m = label_masks[label]
+        elif label == "绿球":
+            m = (h >= 45) & (h <= 100) & (s > 180) & (v > 90)
+            m = m.astype(np.uint8)
+            np.multiply(m, 255, out=m)
+        else:
+            m = _mask_for_label(h, s, v, label)
+        np.bitwise_or(out, m, out=out)
+    return out
+
+
+def _protect_mask(h: Optional[np.ndarray], s: Optional[np.ndarray],
+                  v: Optional[np.ndarray],
                   pockets: Sequence[Point], r: float, cfg,
                   felt_hsv: Optional[Tuple[int, int, int]] = None,
-                  felt_like: Optional[np.ndarray] = None) -> np.ndarray:
+                  felt_like: Optional[np.ndarray] = None,
+                  label_masks: Optional[Dict[str, np.ndarray]] = None
+                  ) -> np.ndarray:
     """球像素保护掩膜：任何球色覆盖的像素都不被台呢去背景涂掉。
 
     关键处理：
@@ -464,34 +462,35 @@ def _protect_mask(h: np.ndarray, s: np.ndarray, v: np.ndarray,
       掩膜），保护掩膜必须排除「与台呢色相近」的像素，否则死循环：
       台面被保护 → 不涂灰 → 整片台面被当成白球候选。
     """
-    protect = np.zeros(h.shape, dtype=bool)
+    protect = np.zeros(h.shape if h is not None else
+                       list(label_masks.values())[0].shape[:2],
+                       dtype=np.uint8)
     for label in PRIORITY:
-        if label == "绿球":
-            # 保护掩膜必须 ≥ 检测掩膜的宽松度（_mask_for_label 绿球用 s>180）。
-            # 原保护用 s>200 比检测更严：球边缘像素不被保护、反被当成台呢
-            # 涂灰 → 绿球缺角/漏检。这里与检测掩膜完全对齐。
-            m = (h >= 45) & (h <= 100) & (s > 180) & (v > 90)
+        if label_masks is not None:
+            # 帧级共享字典（见 compute_label_masks）。绿球条目即检测用的
+            # 高饱和紧掩膜，逐位一致，可直接复用。
+            m = label_masks[label]
         else:
-            m = _mask_for_label(h, s, v, label) > 0
-        protect |= m
+            m = _mask_for_label(h, s, v, label)
+        np.bitwise_or(protect, m, out=protect)
     # 排除与台呢色相近的像素（浅色台面防误保护）
     if felt_like is None and felt_hsv is not None:
         felt_like = felt_like_mask(
             cv2.merge((h, s, v)), cfg, felt_hsv)
     if felt_like is not None:
-        protect = protect & ~(felt_like > 0)
+        protect[felt_like > 0] = 0
     # 挖掉袋口（黑球掩膜覆盖袋洞）
-    mask = (protect * 255).astype(np.uint8)
     for (px, py) in pockets:
-        cv2.circle(mask, (int(px), int(py)), int(1.35 * r), 0, -1)
-    return mask > 0
+        cv2.circle(protect, (int(px), int(py)), int(1.35 * r), 0, -1)
+    return protect > 0
 
 
 def clean_background(warped: np.ndarray, cfg, r: float,
                      pockets: Sequence[Point] = (),
                      exclude_mask: Optional[np.ndarray] = None,
                      hsv: Optional[np.ndarray] = None,
-                     felt_hsv: Optional[Tuple[int, int, int]] = None) -> np.ndarray:
+                     felt_hsv: Optional[Tuple[int, int, int]] = None,
+                     label_masks: Optional[Dict[str, np.ndarray]] = None) -> np.ndarray:
     """把台呢与袋口涂成中性灰，只留球，供颜色掩膜检测。
 
     - 台呢色用直方图峰值自适应估计（合成图 / 真实游戏 / 不同亮度都适用）；
@@ -502,16 +501,39 @@ def clean_background(warped: np.ndarray, cfg, r: float,
     if hsv is None:
         hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
+    if label_masks is None:
+        # 帧级共享：保护掩膜 + 球色保护一次算完，避免逐色重复全帧运算。
+        label_masks = compute_label_masks(h, s, v)
     felt_hsv = (felt_hsv if felt_hsv is not None else
                 estimate_felt_hsv(warped, cfg, hsv=hsv))
     felt = felt_like_mask(hsv, cfg, felt_hsv) > 0
-    felt = felt & ~_protect_mask(h, s, v, pockets, r, cfg,
-                                 felt_hsv=felt_hsv, felt_like=felt)
+    protect = _protect_mask(h, s, v, pockets, r, cfg,
+                             felt_hsv=felt_hsv, felt_like=felt,
+                             label_masks=label_masks)
+    felt = felt & ~(protect > 0)
+    # 袋口挂球保护：红/黄/…/白球色像素 + 带亮高光核心的黑球。
+    # 详见 _ball_color_protect 注释——袋洞与黑球同色，只能靠高光区分。
+    ballish = _ball_color_protect(h, s, v, cfg, label_masks)
+    dark_ball = label_masks["黑球"]
+    k_core = max(3, int(round(0.7 * r)) | 1)
+    bright = (v > int(felt_hsv[2]) + 55).astype(np.uint8)
+    np.multiply(bright, 255, out=bright)
+    bright = cv2.dilate(bright, cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (k_core, k_core)))
+    # 黑球暗色主体仅在其高光附近被保护；袋洞无高光 → 仍可涂灰。
+    dark_ball = cv2.bitwise_and(dark_ball, bright)
+    np.bitwise_or(ballish, dark_ball, out=ballish)
+    # 球缘 AA 混色像素不在紧掩膜内，外扩一圈防袋口涂灰吃掉球边。
+    ballish = cv2.dilate(ballish, np.ones((3, 3), np.uint8))
+    ballish &= ~(felt > 0)
+    felt = felt & (ballish == 0)
     clean = warped.copy()
     clean[felt] = (128, 128, 128)
-    # 袋口涂灰
+    # 袋口涂灰：只涂洞，不涂袋口挂球
+    hole = np.zeros(clean.shape[:2], np.uint8)
     for (px, py) in pockets:
-        cv2.circle(clean, (int(px), int(py)), int(1.35 * r), (128, 128, 128), -1, cv2.LINE_AA)
+        cv2.circle(hole, (int(px), int(py)), int(1.35 * r), 255, -1, cv2.LINE_AA)
+    clean[(hole > 0) & (ballish == 0)] = (128, 128, 128)
     if exclude_mask is not None and exclude_mask.shape == clean.shape[:2]:
         # 连击字样、提示条等已确认 UI 区域不是球候选。直接中性化，后续
         # 所有颜色掩膜和 Hough 分支都会同时看不到它。
@@ -521,7 +543,8 @@ def clean_background(warped: np.ndarray, cfg, r: float,
 
 def compute_foreign_mask(warped: np.ndarray, cfg, r: float,
                          hsv: Optional[np.ndarray] = None,
-                         felt_hsv: Optional[Tuple[int, int, int]] = None) -> np.ndarray:
+                         felt_hsv: Optional[Tuple[int, int, int]] = None,
+                         label_masks: Optional[Dict[str, np.ndarray]] = None) -> np.ndarray:
     """台面内部「外来像素」掩膜（未闭运算）。
 
     遮挡检测和常驻界面学习共用：只查台面内部（忽略库边/袋口外围），
@@ -531,7 +554,8 @@ def compute_foreign_mask(warped: np.ndarray, cfg, r: float,
         return np.zeros((0, 0), np.uint8)
     if hsv is None:
         hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
+    if label_masks is None:
+        h, s, v = cv2.split(hsv)
     felt_hsv = (felt_hsv if felt_hsv is not None else
                 estimate_felt_hsv(warped, cfg, hsv=hsv))
     felt_like = felt_like_mask(hsv, cfg, felt_hsv)
@@ -548,7 +572,8 @@ def compute_foreign_mask(warped: np.ndarray, cfg, r: float,
     foreign[:, x1:] = 0
     # 红球 rack 是合法的单色大连通域，不能把它误判为弹窗；其余颜色
     # 在一帧内通常各只有一颗，超大连通域才有明显的界面特征。
-    red_mask = _mask_for_label(h, s, v, "红球")
+    red_mask = (label_masks["红球"] if label_masks is not None
+                else _mask_for_label(h, s, v, "红球"))
     # 球面的阴影和抗锯齿边缘可能已不再满足红色阈值，但仍会与红球
     # 主体连成一个“大块”。只扩张红色掩膜一个小球半径来保护邻域，
     # 不直接删除所有 foreign，避免真正覆盖台面的白/灰弹窗被放行。
@@ -629,7 +654,8 @@ def transient_ui_mask(warped: np.ndarray, cfg, r: float,
                       hsv: Optional[np.ndarray] = None,
                       gray: Optional[np.ndarray] = None,
                       foreign: Optional[np.ndarray] = None,
-                      felt_hsv: Optional[Tuple[int, int, int]] = None) -> np.ndarray:
+                      felt_hsv: Optional[Tuple[int, int, int]] = None,
+                      label_masks: Optional[Dict[str, np.ndarray]] = None) -> np.ndarray:
     """返回应从球检测中排除的台面 UI 像素。
 
     计分连击、文字提示由许多小笔画组成，单个笔画并不会触发“大面板”
@@ -638,14 +664,21 @@ def transient_ui_mask(warped: np.ndarray, cfg, r: float,
     """
     if foreign is None:
         foreign = compute_foreign_mask(warped, cfg, r, hsv=hsv,
-                                       felt_hsv=felt_hsv)
+                                       felt_hsv=felt_hsv,
+                                       label_masks=label_masks)
     if foreign.size == 0:
         return foreign
     if hsv is None:
         hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
     if gray is None:
         gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-    protected = _verified_white_ball_mask(warped, hsv, gray, r, cfg)
+    # 白球验证（连通域+距离变换）只有候选框真与白色像素相交才需要：
+    # 绝大多数帧没有 UI 文字，白球验证可整帧跳过（曾是每帧数毫秒
+    # 的固定成本）。无相交时 protected≡全零，与旧实现逐位一致。
+    white = (label_masks["白球"] if label_masks is not None
+             else _mask_for_label(hsv[:, :, 0], hsv[:, :, 1],
+                                  hsv[:, :, 2], "白球"))
+    protected: Optional[np.ndarray] = None
     # Close the raw foreign pixels before deciding whether a component is UI.
     # Keep the grouping kernel below a ball diameter: it joins character
     # strokes but does not merge a nearby cue stick with the cue ball.
@@ -667,26 +700,23 @@ def transient_ui_mask(warped: np.ndarray, cfg, r: float,
         # nonzero() pair for every glyph is disproportionately expensive at
         # the 800-1000px analysis size.
         component = labels[y:y + height, x:x + width] == idx
-        component_without_balls = component & ~(
-            protected[y:y + height, x:x + width] > 0)
-        ys, xs = np.nonzero(component_without_balls)
-        if len(xs) == 0:
+        box = _component_ui_box(component, x, y, r, ball_area)
+        if box is None:
             continue
-        area = float(len(xs))
-        local_x = float(xs.min())
-        local_y = float(ys.min())
-        bw = float(xs.max() - local_x + 1.0)
-        bh = float(ys.max() - local_y + 1.0)
-        # 多字符 UI 通常是宽而高的组合体；单颗球的扩张面积仍接近 πr²。
-        is_large = area >= 2.6 * ball_area
-        fill = area / max(1.0, bw * bh)
-        is_wide = (max(bw, bh) >= 4.0 * r
-                   and min(bw, bh) >= 1.15 * r
-                   and fill >= 0.20)
-        if is_large or is_wide:
-            ui_roi = ui[y:y + height, x:x + width]
-            ui_roi[component] = 255
-            ui_boxes.append((x + local_x, y + local_y, bw, bh))
+        if (protected is None
+                and (white[y:y + height, x:x + width] > 0).any()):
+            protected = _verified_white_ball_mask(
+                warped, hsv, gray, r, cfg, white_mask=white)
+        if protected is not None:
+            comp2 = component & ~(
+                protected[y:y + height, x:x + width] > 0)
+            box2 = _component_ui_box(comp2, x, y, r, ball_area)
+            if box2 is None:
+                continue
+            component, box = comp2, box2
+        ui_roi = ui[y:y + height, x:x + width]
+        ui_roi[component] = 255
+        ui_boxes.append(box)
     if ui_boxes:
         # A leading digit or glyph can remain a separate raw component when
         # its gap is just wider than the close kernel.  Join only components
@@ -721,12 +751,37 @@ def transient_ui_mask(warped: np.ndarray, cfg, r: float,
         return ui
     ui = cv2.dilate(ui, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
     # Dilation must not grow back over a verified cue ball.
-    ui[protected > 0] = 0
+    if protected is not None:
+        ui[protected > 0] = 0
     return ui
 
 
+def _component_ui_box(component: np.ndarray, x: int, y: int,
+                      r: float, ball_area: float
+                      ) -> Optional[Tuple[float, float, float, float]]:
+    """组件若呈 UI 几何特征（大面积或宽长条）→ 局部外接框，否则 None。"""
+    ys, xs = np.nonzero(component)
+    if len(xs) == 0:
+        return None
+    area = float(len(xs))
+    local_x = float(xs.min())
+    local_y = float(ys.min())
+    bw = float(xs.max() - local_x + 1.0)
+    bh = float(ys.max() - local_y + 1.0)
+    # 多字符 UI 通常是宽而高的组合体；单颗球的扩张面积仍接近 πr²。
+    is_large = area >= 2.6 * ball_area
+    fill = area / max(1.0, bw * bh)
+    is_wide = (max(bw, bh) >= 4.0 * r
+               and min(bw, bh) >= 1.15 * r
+               and fill >= 0.20)
+    if not (is_large or is_wide):
+        return None
+    return (x + local_x, y + local_y, bw, bh)
+
+
 def _verified_white_ball_mask(warped: np.ndarray, hsv: np.ndarray,
-                              gray: np.ndarray, r: float, cfg) -> np.ndarray:
+                              gray: np.ndarray, r: float, cfg,
+                              white_mask: Optional[np.ndarray] = None) -> np.ndarray:
     """Return disks of white balls that are safe to preserve from a UI mask.
 
     White outlined glyphs can satisfy a simple occupancy test.  The component
@@ -736,7 +791,8 @@ def _verified_white_ball_mask(warped: np.ndarray, hsv: np.ndarray,
     protected = np.zeros(hsv.shape[:2], dtype=np.uint8)
     if r < 3.0:
         return protected
-    white = _mask_for_label(hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2], "白球")
+    white = (white_mask if white_mask is not None
+             else _mask_for_label(hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2], "白球"))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(white, 8)
     edge_threshold = float(getattr(cfg, "circle_min_edge_coverage", 0.42))
     for idx in range(1, n):
@@ -893,31 +949,41 @@ def fit_ball_mask(mask: np.ndarray, cx: float, cy: float, r: float,
 # ---------- 球检测 ----------
 
 def _mask_for_label(h: np.ndarray, s: np.ndarray, v: np.ndarray, label: str) -> np.ndarray:
-    """单色向量化掩膜（与 classify_pixel 规则一致）。"""
+    """单色向量化掩膜（由 BALL_HSV_RULES 生成，与 classify_pixel 同一规则表）。"""
     # All label predicates are comparisons, so converting every full-frame
     # channel to int16 here only creates needless temporaries.  Callers that
     # need signed subtraction (felt matching) perform that conversion once at
     # their boundary.
     hh, ss, vv = h, s, v
-    if label == "白球":
-        ok = (ss < 80) & (vv > 150)
-    elif label == "黑球":
-        ok = (vv < 62) & (ss < 130)
-    elif label == "红球":
-        ok = ((hh <= 10) | (hh >= 170)) & (ss > 130) & (vv > 120)
-    elif label == "粉球":
-        ok = (hh >= 150) & (hh <= 176) & (ss > 70) & (vv > 160)
-    elif label == "黄球":
-        ok = (hh >= 18) & (hh <= 45) & (ss > 110) & (vv > 190)
-    elif label == "绿球":
-        ok = (hh >= 45) & (hh <= 100) & (ss > 180) & (vv > 90)
-    elif label == "棕球":
-        ok = (hh >= 8) & (hh <= 32) & (ss > 70) & (vv >= 40) & (vv <= 165)
-    elif label == "蓝球":
-        ok = (hh >= 100) & (hh <= 130) & (ss > 140) & (vv > 80)
-    else:
-        ok = np.zeros(hh.shape, dtype=bool)
-    return (ok * 255).astype(np.uint8)
+    rule = BALL_HSV_RULES.get(label)
+    if rule is None:
+        return np.zeros(hh.shape, dtype=np.uint8)
+    h_ranges, (s_lo, s_hi), (v_lo, v_hi) = rule
+    ok = (ss >= s_lo) & (ss <= s_hi) & (vv >= v_lo) & (vv <= v_hi)
+    if h_ranges is not None:
+        hm = np.zeros(hh.shape, dtype=bool)
+        for lo, hi in h_ranges:
+            hm |= (hh >= lo) & (hh <= hi)
+        ok &= hm
+    # 每帧 20+ 次调用曾是热点：(ok * 255) 生成 int64 临时数组，
+    # astype 再拷一份。bool 与 uint8 等宽，视图重解释后原地 ×255
+    # 零新增分配，结果与旧实现逐位一致（0/255）。
+    if not ok.flags.c_contiguous:
+        ok = np.ascontiguousarray(ok)
+    out = ok.view(np.uint8)
+    np.multiply(out, 255, out=out)
+    return out
+
+
+def compute_label_masks(h: np.ndarray, s: np.ndarray, v: np.ndarray
+                        ) -> Dict[str, np.ndarray]:
+    """一次算出全部 8 个颜色掩膜，供台呢清理/外来检测/球检测共用。
+
+    同一帧内 _protect_mask、compute_foreign_mask、detect_balls 各自
+    调用 _mask_for_label 会把同一组全帧布尔运算重复三遍；按帧算
+    一份共享字典后每帧只算一遍。
+    """
+    return {label: _mask_for_label(h, s, v, label) for label in PRIORITY}
 
 
 def _split_blobs(mask: np.ndarray, color: np.ndarray, r: float,
@@ -1061,16 +1127,26 @@ def refine_red_rack(centers: Sequence[Point], r: float,
         if mask is not None:
             # 每个预测球心附近都必须确实存在红色像素；这是防止
             # 缺球/散开局面被完整 rack 先验凭空补回的关键校验。
-            yy, xx = np.mgrid[:mask.shape[0], :mask.shape[1]]
+            # 局部小窗代替全帧 mgrid：15 个探针 × 全帧布尔运算曾是
+            # rack 帧的显著热点（探针半径只有 ~0.4r，全帧运算几乎
+            # 全是浪费）。
             probe_r = 0.42 * min(radius_x, radius_y)
-            cover = []
+            pr = max(1, int(math.ceil(probe_r)) + 1)
+            mh, mw = mask.shape[:2]
             for gx, gy in grid:
-                inside = (xx - gx) ** 2 + (yy - gy) ** 2 <= probe_r * probe_r
+                x0 = max(0, int(math.floor(gx)) - pr)
+                x1 = min(mw, int(math.floor(gx)) + pr + 1)
+                y0 = max(0, int(math.floor(gy)) - pr)
+                y1 = min(mh, int(math.floor(gy)) + pr + 1)
+                if x1 <= x0 or y1 <= y0:
+                    return None
+                ly, lx = np.mgrid[y0:y1, x0:x1]
+                inside = ((lx - gx) ** 2 + (ly - gy) ** 2
+                          <= probe_r * probe_r)
                 if not inside.any():
                     return None
-                cover.append(float((mask[inside] > 0).mean()))
-            if min(cover) < 0.65:
-                return None
+                if float((mask[y0:y1, x0:x1][inside] > 0).mean()) < 0.65:
+                    return None
         return grid
 
     row_h = math.sqrt(3.0) * r
@@ -1115,6 +1191,7 @@ def refine_red_rack(centers: Sequence[Point], r: float,
     cand = list(centers)
     used = [False] * len(cand)
     total = 0.0
+    worst = 0.0
     for gx, gy in grid:
         best, bi = 1e18, -1
         for i, (px, py) in enumerate(cand):
@@ -1123,10 +1200,19 @@ def refine_red_rack(centers: Sequence[Point], r: float,
             d = (px - gx) ** 2 + (py - gy) ** 2
             if d < best:
                 best, bi = d, i
-        if bi >= 0:
-            used[bi] = True
-            total += best ** 0.5
-    if len(grid) != 15 or not all(used) or total / len(grid) > 1.4 * r:
+        if bi < 0:
+            return None
+        used[bi] = True
+        dist = best ** 0.5
+        total += dist
+        worst = max(worst, dist)
+    # 平均距离与最远点双重校验。只查平均时，15 个候选里混入一颗远处
+    # 的多余候选、某颗真球缺失也能通过（其余 14 颗距离极小把平均值
+    # 拉低），先验网格会把已打掉的红球“复活”出来指向不存在的球。
+    # 任一网格点 1.4r 内无候选 → 整体拒绝重建。
+    if len(grid) != 15 or not all(used):
+        return None
+    if total / len(grid) > 1.4 * r or worst > 1.4 * r:
         return None
     return grid
 
@@ -1156,10 +1242,7 @@ def detect_balls(warped: np.ndarray, r: float, cfg=None,
         clean[exclude_mask > 0] = (128, 128, 128)
     hsv = cv2.cvtColor(clean, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
-    label_masks = {
-        label: _mask_for_label(h, s, v, label)
-        for label in PRIORITY
-    }
+    label_masks = compute_label_masks(h, s, v)
     clean_gray = cv2.cvtColor(clean, cv2.COLOR_BGR2GRAY)
     found: List[Ball] = []
     for label in PRIORITY:
@@ -1221,9 +1304,9 @@ def detect_balls(warped: np.ndarray, r: float, cfg=None,
     # 仍是一个大连通 rack 时才使用整体边界；散开球或缺球不重建。
     reds = [b for b in merged if b.label == "红球"]
     if cfg.rack_fit and len(raw_reds) >= 15:
-        red_mask = _mask_for_label(hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2], "红球")
+        # 上方 label_masks 已在 clean HSV 上算过红球掩膜，这里不再重算。
         red_mask = cv2.morphologyEx(
-            red_mask, cv2.MORPH_CLOSE,
+            label_masks["红球"], cv2.MORPH_CLOSE,
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
         n_red, red_labels, red_stats, _ = cv2.connectedComponentsWithStats(red_mask, 8)
         red_bounds = None
@@ -1364,6 +1447,11 @@ def circle_edge_coverage(gray: np.ndarray, pos: Point, r: float,
     真实球在接近整圈的位置都有“球面→台呢”的亮度差；文字和 UI 图标
     虽然可能恰好有一个近圆的局部，却不能连续覆盖一圈。采样内外两条
     圆环的最大差值，避免球面高光和阴影影响中心颜色判断。
+
+    两条采样环都越界的 bin 不计入分母：贴库球朝向库边的采样环必然
+    落在图像边界外，旧实现按 0 计会把真球覆盖率拉到门限以下而静默
+    剔除（白球贴库后从画面消失）。可见弧过短（<1/4 圆周）时样本
+    已无判别力，直接按不合格处理。
     """
     if gray is None or r < 3:
         return 0.0
@@ -1379,8 +1467,10 @@ def circle_edge_coverage(gray: np.ndarray, pos: Point, r: float,
             x1, y1 = int(round(cx + outer * r * co)), int(round(cy + outer * r * si))
             if 0 <= x0 < w and 0 <= y0 < h and 0 <= x1 < w and 0 <= y1 < h:
                 samples.append(abs(int(gray[y0, x0]) - int(gray[y1, x1])))
-        contrasts.append(float(max(samples)) if samples else 0.0)
-    if not contrasts:
+        if not samples:
+            continue                      # 该方向两条环均越界：贴库球，剔除出分母
+        contrasts.append(float(max(samples)))
+    if len(contrasts) < max(8, bins // 4):
         return 0.0
     # The absolute threshold is deliberately modest: QQ balls have gradients
     # and anti-aliased rims, while score glyphs only light up isolated bins.
@@ -1395,13 +1485,6 @@ def pick_cue(balls: Sequence[Ball]) -> Optional[Ball]:
     whites.sort(key=lambda b: abs(b.radius - (0.01125 * TABLE_W)))
     return whites[0]
 
-
-def find_target(balls: Sequence[Ball], cue: Ball) -> Optional[Ball]:
-    """（八球语义的）目标球：距离母球最近的非母球。斯诺克场景请用决策层选球。"""
-    others = [b for b in balls if b is not cue]
-    if not others:
-        return None
-    return min(others, key=lambda b: ((b.pos[0] - cue.pos[0]) ** 2 + (b.pos[1] - cue.pos[1]) ** 2))
 
 
 # ---------- 袋口 ----------
@@ -1560,7 +1643,6 @@ class TableTracker:
         self.miss = 0
         self.frame = 0
         self._jump = 0          # 连续大偏移计数（真移动 vs 偶发斜检）
-        self._jump_quad: Optional[np.ndarray] = None
         self._jump_samples: List[np.ndarray] = []
 
     def update(self, frame: np.ndarray) -> Optional[np.ndarray]:
@@ -1573,7 +1655,6 @@ class TableTracker:
         if q is None:
             self.miss += 1
             self._jump = 0
-            self._jump_quad = None
             self._jump_samples = []
             if self.miss >= self.cfg.table_max_miss:
                 self.quad = None          # 解锁，强制重新检测
@@ -1582,7 +1663,6 @@ class TableTracker:
         if self.quad is None:
             self.quad = q
             self._jump = 0
-            self._jump_quad = None
             self._jump_samples = []
         else:
             # 跳变拒绝：单次重检的角点大偏移多半是边带拟合被污染
@@ -1600,7 +1680,6 @@ class TableTracker:
                 delta_center = np.median(delta, axis=0)
                 if float(np.abs(delta - delta_center).max()) > rigid_tol:
                     self._jump = 0
-                    self._jump_quad = None
                     self._jump_samples = []
                     return self.quad
 
@@ -1617,7 +1696,6 @@ class TableTracker:
                 else:
                     self._jump_samples = [q.copy()]
                 self._jump = len(self._jump_samples)
-                self._jump_quad = q.copy()
                 confirmations = max(
                     1, int(getattr(self.cfg, "table_move_confirmations", 3)))
                 if self._jump < confirmations:
@@ -1625,7 +1703,6 @@ class TableTracker:
                 self.quad = np.median(
                     np.asarray(self._jump_samples), axis=0).astype(np.float32)
                 self._jump = 0
-                self._jump_quad = None
                 self._jump_samples = []
             else:
                 # 锁定框是识别基准，不应把每次重检的 2~7px 边缘噪声
@@ -1633,7 +1710,6 @@ class TableTracker:
                 # jump_thresh，并连续确认，才在上面的分支中更新锁定框。
                 # 真实窗口移动会在后续重检中继续累积到该阈值。
                 self._jump = 0
-                self._jump_quad = None
                 self._jump_samples = []
         return self.quad
 
