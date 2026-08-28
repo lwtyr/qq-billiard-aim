@@ -1464,8 +1464,7 @@ class App:
         x1 = int(q[:, 0].max()) + pad
         y1 = int(q[:, 1].max()) + pad
         self.region = [x0, y0, x1 - x0, y1 - y0]
-        self.cfg.capture_region = self.region
-        self.cfg.save()
+        # 自动框选仅限本场会话内存使用，绝不固化到 config.json（防止窗口移动后截错画面）
         self._auto_region_enabled = False
         self._advance_capture_generation()
         print(f"[自动框选] 首次锁定区域: {self.region}", flush=True)
@@ -1507,17 +1506,15 @@ class App:
             handler()
 
     def _key_select_pocket(self, idx: int) -> None:
-        """1-6：手动指定袋口，关闭自动选袋。"""
+        """1-6：手动指定袋口，关闭自动选袋（对局临时生效，不写盘）。"""
         self.cfg.selected_pocket = idx
         self.cfg.auto_pocket = False
-        self.cfg.save()
         self._redetect()
 
     def _key_auto_pocket(self) -> None:
         """0：恢复自动选袋。"""
         self.cfg.selected_pocket = -1
         self.cfg.auto_pocket = True
-        self.cfg.save()
         self._redetect()
 
     def _key_pick_toggle(self) -> None:
@@ -1922,6 +1919,10 @@ def main() -> int:
     if region:
         cfg.capture_region = region
         cfg.save()
+    # 每次启动默认全袋口自动规划 + 开启库边解围
+    cfg.auto_pocket = True
+    cfg.selected_pocket = -1
+    cfg.allow_kicks = True
     App(cfg, region=region, start_manual=args.manual).run()
     return 0
 
