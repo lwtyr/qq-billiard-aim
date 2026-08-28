@@ -422,6 +422,45 @@ KICK_SEQUENCES: Tuple[Tuple[str, ...], ...] = (
 )
 
 
+MID_POCKET_MIN_COS = 0.55
+"""中袋入射角限制：进袋方向与袋口内法线夹角 ≤ ≈57°。中袋开口窄，
+大斜角必撞袋角弹出；QQ 2D 无「运气球」，直接判不可行。"""
+CORNER_POCKET_MIN_COS = 0.42
+"""角袋入射角限制（≤ ≈65°）。角袋沿库边抹进仍可行（cos≈0.7），阈值放宽。"""
+
+
+def pocket_entry_ok(shot: Shot, w: float, h: float, r: float,
+                    mid_cos: float = MID_POCKET_MIN_COS,
+                    corner_cos: float = CORNER_POCKET_MIN_COS) -> bool:
+    """目标球进袋的入射方向是否在该袋口的可捕获范围内。
+
+    目标球被击后沿「鬼球 → 袋口」方向运动。中袋只能正对进
+    （与内法线夹角小），大斜角穿袋口必撞袋角弹出；角袋可沿库边
+    抹进，阈值更宽。鬼球距袋口 < 2r 时方向几何不稳，放行。
+    """
+    p, g = shot.pocket, shot.ghost
+    if dist(g, p) < 2.0 * r:
+        return True
+    # 只约束上/下长边上的袋口；左右短边无标准袋位，保守放行。
+    if not (p[1] <= r or p[1] >= h - r):
+        return True
+    if abs(p[0] - w / 2.0) < 0.25 * w:      # 中袋（长边中点附近）
+        n = (0.0, -1.0) if p[1] <= r else (0.0, 1.0)
+        cos_min = mid_cos
+    else:                                    # 角袋：法线 = 指向台内的对角方向
+        nx = -1.0 if p[0] < w / 2.0 else 1.0
+        ny = -1.0 if p[1] <= r else 1.0
+        ilen = math.hypot(nx, ny)
+        n = (nx / ilen, ny / ilen)
+        cos_min = corner_cos
+    d = sub(p, g)
+    ilen = math.hypot(d[0], d[1])
+    if ilen < 1e-9:
+        return True
+    cos_in = (d[0] * n[0] + d[1] * n[1]) / ilen
+    return cos_in >= cos_min
+
+
 def plan_shots(cue: Point, target: Point, pockets: Sequence[Point], r: float,
                w: float, h: float, others: Sequence[Point] = (),
                allow_kicks: bool = True, max_kicks: int = 2,
@@ -462,6 +501,8 @@ def plan_shots(cue: Point, target: Point, pockets: Sequence[Point], r: float,
             base = 3 + len(s.bounce_points)
         return (base, s.total)
     plans = [s for s in plans if not s.blocked]
+    # 中袋大斜角物理上进不了（撞袋角弹出），入射角超限直接淘汰。
+    plans = [s for s in plans if pocket_entry_ok(s, w, h, r)]
     plans.sort(key=key)
     return plans
 

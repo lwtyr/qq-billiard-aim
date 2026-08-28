@@ -116,7 +116,7 @@ except ModuleNotFoundError as exc:
         "请在项目目录运行: python -m pip install -r requirements.txt"
     )
 
-APP_VERSION = "3.6.2"
+APP_VERSION = "3.6.3"
 
 HELP_TEXT = ("1-6 选袋口 | 0 自动 | G 点选目标球 | M 手动录入 | R 框选区域 | K 库边解围 | "
              "Q 红/彩切换 | O 兼容切换 | P 自动袋口 | B 球标注 | X 穿透 | T 隐藏 | C 重识别 | Esc 退出")
@@ -968,6 +968,8 @@ def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
                 if k.valid and not k.blocked:
                     plans.append(k)
                     break
+        # 手动选袋同样要过中袋入射角校验（与 plan_shots 同规则）。
+        plans = [s for s in plans if physics.pocket_entry_ok(s, W, H, r)]
         shot = (physics.best_shot(plans, W, table_height=float(H),
                                   pocket_radius=cfg.pocket_accept_ratio * r,
                                   ball_radius=r, pockets=pockets_t)
