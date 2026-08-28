@@ -165,6 +165,24 @@ def test_region_selection_uses_overlay_start_and_finishes(monkeypatch):
     assert app._region_start is None
 
 
+def test_q_key_toggles_red_and_color_target_mode(monkeypatch):
+    """Q 键应立即切换红球阶段的 ball-on 状态。"""
+    app = App.__new__(App)
+    app.cfg = config.Config()
+    app.scene = {"balls": [{"label": "白球"}, {"label": "红球"},
+                            {"label": "黑球"}]}
+    app.turn_tracker = snooker.TurnTracker()
+    app.overlay = None
+    app._redetect = lambda: None
+
+    app.on_key("q")
+    assert app.turn_tracker.ball_on == "color"
+    assert "彩球" in app.scene["hint"]
+    app.on_key("q")
+    assert app.turn_tracker.ball_on == "red"
+    assert "红球" in app.scene["hint"]
+
+
 def test_analyze_hides_aim_until_ball_positions_settle():
     """跨帧确认期间只能显示球位，READY 后才允许输出瞄准线。"""
     img, _ = synth.random_layout(seed=12)

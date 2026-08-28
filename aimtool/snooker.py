@@ -46,7 +46,10 @@ class TurnTracker:
         if not stable:
             return self.ball_on or ("clear" if reds == 0 else "red")
         if self._reds is None:
-            self.ball_on = "clear" if reds == 0 else "red"
+            # Q 可能在首个稳定帧前按下；已有手动状态时保留它，
+            # 否则按当前台面初始化默认状态。
+            if self.ball_on is None:
+                self.ball_on = "clear" if reds == 0 else "red"
         elif reds < self._reds:
             # 红球数减少（包括最后一颗红球）后，下一杆都必须先选彩球。
             # 不能在 reds==0 时直接进入 clear，否则会跳过最后一颗红后的
@@ -63,14 +66,44 @@ class TurnTracker:
         return self.ball_on or "red"
 
     def cycle_manual(self, balls: Sequence) -> str:
-        """处理无法由视觉确定的失误/换手情况。"""
-        if reds_remaining(balls) == 0:
+        """手动切换红球/彩球目标，并同步当前画面的计数基线。
+
+        视觉只能看到球是否还在台面上，不能知道上一杆是未进球、犯规还是
+        成功入袋。同步 ``_reds``/``_colors`` 很重要：否则在首次识别完成前
+        按键，下一次 ``update`` 会把刚切换的状态重新初始化掉。
+        """
+        if not balls and self._reds is None:
+            # 尚未得到任何球列表时，仍允许 Q 在默认红球与红后彩球之间
+            # 来回切换；不要把未知状态伪装成“无红球”的清彩状态。
+            self.ball_on = "color" if self.ball_on in (None, "red") else "red"
+            return self.ball_on
+        if balls:
+            reds = reds_remaining(balls)
+            colors = sum(1 for b in balls if b.label in COLOR_ORDER)
+        else:
+            # 识别线程可能正处于稳定确认/换帧窗口，使用最近一次可靠计数，
+            # 不让一次空场景把 Q 的即时切换错误地变成清彩阶段。
+            reds = self._reds
+            colors = self._colors or 0
+        if reds == 0:
             self.ball_on = "clear"
-        elif self.ball_on == "red":
+        elif self.ball_on in (None, "red"):
+            # 未完成首帧同步时，None 代表默认的红球目标状态；Q 仍应
+            # 像用户看到的“当前是红球”一样切到红后选彩。
             self.ball_on = "color"
         else:
             self.ball_on = "red"
+        if balls:
+            self._reds, self._colors = reds, colors
         return self.ball_on
+
+    def toggle_red_color(self, balls: Sequence) -> str:
+        """Q 键入口：红球仍在时，在红球与红后选彩之间切换。
+
+        无红球时不能回到红球目标，始终保持清彩阶段的严格顺序。
+        ``cycle_manual`` 保留为旧 O 键的兼容入口。
+        """
+        return self.cycle_manual(balls)
 
 
 def phase(balls: Sequence) -> str:
@@ -160,6 +193,35 @@ def _plan(cue, target, pockets: Sequence[physics.Point], r: float,
     )
 
 
+def target_shot_key(shot: physics.Shot) -> Tuple[float, float, int, float]:
+    """自动选球的优先级：切角、目标到袋距离、库数、总路程。
+
+    ``plan_shots`` 已经会过滤被挡路线；这里再次检查 ``blocked``，让决策
+    层即使收到测试替身或其它规划器的结果，也绝不会把有障碍的路线推荐给
+    用户。切角和目标到袋距离严格排在总路程之前，符合实战选球顺序。
+    """
+    if not shot.valid or shot.blocked:
+        return (float("inf"), float("inf"), 999, float("inf"))
+    return (
+        float(shot.cut_deg),
+        float(shot.target_to_pocket),
+        len(shot.bounce_points),
+        float(shot.total),
+    )
+
+
+def rank_target_shots(plans: Sequence[physics.Shot]) -> List[physics.Shot]:
+    """返回没有障碍的路线，并按自动选球规则排序。"""
+    clear = [s for s in plans if s.valid and not s.blocked]
+    return sorted(clear, key=target_shot_key)
+
+
+def best_target_shot(plans: Sequence[physics.Shot]) -> Optional[physics.Shot]:
+    """取一颗目标球对应的最佳无障碍路线。"""
+    ranked = rank_target_shots(plans)
+    return ranked[0] if ranked else None
+
+
 def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
                   r: float, w: float, h: float, cfg,
                   prefer: Optional[physics.Point] = None,
@@ -167,11 +229,12 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
     """选择目标球。
 
     返回 (target_ball, phase, 说明文字)；target_ball 为 None 表示该阶段无可行目标。
-    红球阶段：逐颗红球生成击球方案，选「未挡优先 + 总路程短」的最优；
-    清彩阶段：按分值顺序找第一颗有可行方案的在场彩球。
+    红球阶段：逐颗红球生成方案，只保留无障碍路线，按「切角小 → 目标离袋近
+    → 库数少 → 总路程短」选择；红后任选彩球阶段仍按这套自动优先级，红球
+    清完后的清彩阶段才按分值顺序只尝试当前最低分值的在场彩球。
 
-    prefer：上一帧选定的目标球位置（台面坐标）。若该球仍在场且有可行方案，
-    则沿用（避免 15 颗红球时目标在帧间跳变导致瞄准线乱动）。
+    prefer：上一帧选定的目标球位置（台面坐标），仅作为完全同级候选的
+    最后平局条件，不能压过新的切角/袋口优先级。
     """
     selected_on = ball_on or ("red" if phase(balls) == "red" else "clear")
     if selected_on == "red":
@@ -182,27 +245,20 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
             selected_on = "clear" if not any(
                 b.label in COLOR_ORDER for b in balls) else "color"
         else:
-            # 目标记忆：上一帧选的红球仍可打则沿用
-            if prefer is not None:
-                cand = min(reds, key=lambda b: (b.pos[0] - prefer[0]) ** 2 + (b.pos[1] - prefer[1]) ** 2)
-                if physics.dist(cand.pos, prefer) < 2.0 * r:
-                    plans = _plan(cue, cand, pockets, r, w, h,
-                                  _others(balls, cue, cand), cfg)
-                    if plans:
-                        n = reds_remaining(balls)
-                        return cand, "red", f"红球阶段（剩 {n} 颗红球）：打红球"
-            best: Optional[Tuple[Tuple[float, float], object]] = None
+            best: Optional[Tuple[Tuple[float, ...], object]] = None
             for tb in reds:
                 plans = _plan(cue, tb, pockets, r, w, h,
                               _others(balls, cue, tb), cfg)
-                if not plans:
+                shot = best_target_shot(plans)
+                if shot is None:
                     continue
-                s = physics.best_shot(plans, w)
-                if s is None:
-                    continue
-                # 目标球选择也使用路线风险分数：自动模式不会为了几厘米
-                # 的短路程去选极薄切或高风险多库球。
-                key = (physics.route_score(s, w), s.total)
+                key = target_shot_key(shot)
+                if prefer is not None:
+                    # 只在前面的规则完全打平时保持上一颗目标，减少识别
+                    # 噪声造成的跳变；距离放在规则键之后，不改变优先级。
+                    key = key + (physics.dist(tb.pos, prefer),)
+                else:
+                    key = key + (float(tb.pos[0]), float(tb.pos[1]))
                 if best is None or key < best[0]:
                     best = (key, tb)
             if best is not None:
@@ -210,22 +266,26 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
                 return best[1], "red", f"红球阶段（剩 {n} 颗红球）：打红球"
             return None, "red", "红球阶段：所有红球暂无可行方案"
     if selected_on == "color":
+        # 红球仍在时，红后彩球是任选目标；按自动选球优先级在所有
+        # 彩球中挑选。红球清完后会由 clear 状态进入严格清彩顺序。
         colors = [b for b in balls if b.label in COLOR_ORDER]
-        best: Optional[Tuple[Tuple[float, float], object]] = None
+        best: Optional[Tuple[Tuple[float, ...], object]] = None
         for tb in colors:
             plans = _plan(cue, tb, pockets, r, w, h,
                           _others(balls, cue, tb), cfg)
-            if not plans:
-                continue
-            shot = physics.best_shot(plans, w)
+            shot = best_target_shot(plans)
             if shot is None:
                 continue
-            key = (physics.route_score(shot, w), shot.total)
+            key = target_shot_key(shot)
+            if prefer is not None:
+                key = key + (physics.dist(tb.pos, prefer),)
+            else:
+                key = key + (float(tb.pos[0]), float(tb.pos[1]))
             if best is None or key < best[0]:
                 best = (key, tb)
         if best is not None:
-            return best[1], "color", f"红球后选彩球：打{best[1].label}"
-        return None, "color", "红球后选彩球：所有彩球暂无可行方案"
+            return best[1], "color", f"红后任选彩球：打{best[1].label}"
+        return None, "color", "红后任选彩球：所有彩球暂无可行方案"
 
     # 清彩阶段必须严格按分值顺序：只考虑「下一颗该打的彩球」。
     # 原实现会跳过无方案的黄球直接打绿球——实战中这是犯规送分。
@@ -235,6 +295,6 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
     plans = _plan(cue, tb, pockets, r, w, h,
                   _others(balls, cue, tb), cfg)
     v = COLOR_VALUE[tb.label]
-    if plans:
+    if best_target_shot(plans) is not None:
         return tb, "color", f"清彩阶段：打{tb.label}（{v} 分）"
     return None, "color", f"清彩阶段：{tb.label}（{v} 分）暂无可行方案（被挡或切角过大）"

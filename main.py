@@ -9,7 +9,7 @@
 
 热键（Overlay 窗口激活时）：
   1-6 选择袋口 · 0 自动选袋口 · G 点选目标球 · M 手动录入(母球→目标球→袋口) · R 框选球桌区域
-  K 库边解围开关 · P 自动袋口开关 · X 鼠标穿透开关 · T 隐藏/显示 · C 重新识别 · Esc 退出
+  K 库边解围开关 · P 自动袋口开关 · Q 红/彩切换 · X 鼠标穿透开关 · T 隐藏/显示 · C 重新识别 · Esc 退出
 """
 from __future__ import annotations
 
@@ -115,8 +115,10 @@ except ModuleNotFoundError as exc:
         "请在项目目录运行: python -m pip install -r requirements.txt"
     )
 
+APP_VERSION = "3.5.0"
+
 HELP_TEXT = ("1-6 选袋口 | 0 自动 | G 点选目标球 | M 手动录入 | R 框选区域 | K 库边解围 | "
-             "O 切换红/彩球权 | P 自动袋口 | B 球标注 | X 穿透 | T 隐藏 | C 重识别 | Esc 退出")
+             "Q 红/彩切换 | O 兼容切换 | P 自动袋口 | B 球标注 | X 穿透 | T 隐藏 | C 重识别 | Esc 退出")
 
 COLOR_HEX = {
     "白球": "#ebebef",
@@ -593,7 +595,8 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
         return scene
 
     # 母球 / 目标球（斯诺克决策层；支持手动录入覆盖）
-    # prefer_target/prefer_pocket：上一帧选定，用于稳定瞄准线（防目标/袋口跳变）
+    # prefer_target：上一帧目标只用于规则键完全打平时的稳定性；自动袋口
+    # 现在始终按同一套切角/离袋距离优先级重新选择，不沿用旧袋口。
     cue_t = manual_cue
     cue_b = None
     if cue_t is None:
@@ -720,7 +723,7 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
         scene["analysis_ms"] = round((time.perf_counter() - started_at) * 1000.0, 1)
         return scene
 
-    # 瞄准方案（袋口记忆：prefer_pocket 可行且不比最优差太多时沿用）
+    # 瞄准方案：自动模式与 snooker.choose_target 使用同一套路线排序。
     rail_inset = max(0.0, float(getattr(cfg, "rail_inset_ratio", 1.0)) * r)
     pocket_clearance = 1.35 * r
     sel_idx = manual_pocket_idx if manual_pocket_idx is not None else cfg.selected_pocket
@@ -757,23 +760,13 @@ def analyze(frame: np.ndarray, cfg: config_mod.Config,
                                    target_radius=target_radius,
                                    ghost_offset=ghost_offset)
         if plans:
-            ranked = physics.rank_shots(plans, W)
-            best = ranked[0]
-            best_score = physics.route_score(best, W)
-            if prefer_pocket is not None and cfg.auto_pocket:
-                for s in ranked:
-                    if physics.dist(s.pocket, prefer_pocket) < max(6.0, 1.5 * r):
-                        # 沿用上一袋口：路线仍通畅，且风险分数不比当前最优
-                        # 差太多，避免每帧在相邻袋口之间来回跳。
-                        score = physics.route_score(s, W)
-                        if score <= max(best_score * 1.35, best_score + 300.0):
-                            shot = s
-                            break
-                if shot is None:
-                    shot = best
-            else:
+            # 自动选球规则要求切角和目标到袋距离优先于总路程；沿用
+            # 决策层的同一排序，避免“选中一颗球”和“显示另一条路线”。
+            ranked = snooker.rank_target_shots(plans)
+            if ranked:
+                best = ranked[0]
                 shot = best
-            if cfg.auto_pocket and len(ranked) > 1:
+            if ranked and cfg.auto_pocket and len(ranked) > 1:
                 alts = ranked[1:4]
                 alt_txt = "  ".join(
                     f"袋{idx + 1}·{s.label}" for s in alts
@@ -1193,14 +1186,16 @@ class App:
             cfg.selected_pocket = -1
             cfg.save()
             self._redetect()
-        elif keysym == "o":
+        elif keysym in {"q", "o"}:
+            # Q 是红球阶段的快速入口；O 保留为旧版本兼容热键。
             # 换手/失误无法可靠地由单帧视觉判断，允许用户显式切换当前球权。
             balls = [type("BallRef", (), {"label": b.get("label")})()
                      for b in self.scene.get("balls", [])]
-            ball_on = self.turn_tracker.cycle_manual(balls)
-            self.scene["hint"] = ("规则状态：打红球" if ball_on == "red"
-                                  else "规则状态：红球后选彩球" if ball_on == "color"
-                                  else "规则状态：清彩阶段")
+            ball_on = self.turn_tracker.toggle_red_color(balls)
+            self.scene["hint"] = ("规则状态：打红球（Q 可切换为彩球）" if ball_on == "red"
+                                  else "规则状态：红球后选彩球（Q 可切回红球）"
+                                  if ball_on == "color"
+                                  else "规则状态：清彩顺序 黄→绿→棕→蓝→粉→黑")
             self._redetect()
         elif keysym == "x":
             on = not getattr(self.overlay, "_click_through", False)
@@ -1473,7 +1468,7 @@ def main() -> int:
 
     if not args.demo and not args.frame:
         print("=" * 52, flush=True)
-        print(f"  QQ 2D桌球 斯诺克瞄准器  v3.4 PID={os.getpid()} "
+        print(f"  QQ 2D桌球 斯诺克瞄准器  v{APP_VERSION} PID={os.getpid()} "
               f"{time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
         print("  本行若能写入 runtime.log，说明程序已常驻", flush=True)
         print("  日志编码 UTF-8；若显示乱码请用记事本打开 runtime.log", flush=True)

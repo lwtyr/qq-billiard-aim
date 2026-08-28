@@ -154,6 +154,125 @@ def test_snooker_decision_red_phase():
     assert tb is not None and tb.label == "红球"
 
 
+def _stub_shot(cut, target_to_pocket, total, blocked=False, rails=()):
+    return physics.Shot(
+        pocket=(0.0, 0.0), ghost=(10.0, 10.0), aim_dir=(1.0, 0.0),
+        cue_to_contact=total / 2.0, target_to_pocket=target_to_pocket,
+        total=total, cut_deg=cut, valid=True, blocked=blocked,
+        bounce_points=list((float(i), float(i)) for i in range(len(rails))),
+        rail_seq=tuple(rails), label="直球" if not rails else f"{len(rails)}库",
+    )
+
+
+def test_auto_target_prioritizes_cut_then_pocket_then_clear_route(monkeypatch):
+    """自动选球按切角、离袋距离排序，并拒绝任何有障碍的候选。"""
+    cfg = config.Config(allow_kicks=False)
+    r = cfg.ball_radius_ratio * W
+    cue = vision.Ball("白球", (300.0, 500.0), r)
+    red_cut = vision.Ball("红球", (700.0, 300.0), r)
+    red_near = vision.Ball("红球", (900.0, 300.0), r)
+    red_blocked = vision.Ball("红球", (1100.0, 300.0), r)
+    shots = {
+        id(red_cut): [_stub_shot(5.0, 500.0, 1200.0)],
+        id(red_near): [_stub_shot(8.0, 120.0, 1500.0)],
+        id(red_blocked): [_stub_shot(1.0, 80.0, 700.0, blocked=True)],
+    }
+    monkeypatch.setattr(
+        snooker, "_plan",
+        lambda _cue, target, *_args: shots[id(target)],
+    )
+    pockets = physics.default_pockets(W, H)
+
+    target, selected_phase, _ = snooker.choose_target(
+        [cue, red_cut, red_near, red_blocked], cue, pockets, r, W, H, cfg,
+        ball_on="red",
+    )
+
+    assert selected_phase == "red"
+    assert target is red_cut       # smaller cut beats a nearer, wider-cut route
+    shots[id(red_blocked)] = [_stub_shot(5.0, 80.0, 700.0, blocked=False)]
+    target, _, _ = snooker.choose_target(
+        [cue, red_cut, red_near, red_blocked], cue, pockets, r, W, H, cfg,
+        ball_on="red",
+    )
+    assert target is red_blocked    # equal cut, then nearest target-to-pocket
+
+
+def test_turn_tracker_q_toggle_survives_next_visual_update():
+    """Q 切换后下一帧不能被状态机重新初始化覆盖。"""
+    cfg = config.Config()
+    r = cfg.ball_radius_ratio * W
+    cue = vision.Ball("白球", (300.0, 500.0), r)
+    red = vision.Ball("红球", (700.0, 500.0), r)
+    black = vision.Ball("黑球", (1500.0, 500.0), r)
+    balls = [cue, red, black]
+    tracker = snooker.TurnTracker()
+
+    assert tracker.update(balls, stable=True) == "red"
+    assert tracker.toggle_red_color(balls) == "color"
+    assert tracker.update(balls, stable=True) == "color"
+    assert tracker.toggle_red_color(balls) == "red"
+    # 最后一颗红球消失后，下一杆仍是红后任选彩球。
+    assert tracker.update([cue, black], stable=True) == "color"
+
+
+def test_q_toggle_before_first_detection_is_preserved():
+    """首帧尚未产生球列表时按 Q，后续识别仍保持彩球目标状态。"""
+    r = config.Config().ball_radius_ratio * W
+    cue = vision.Ball("白球", (300.0, 500.0), r)
+    red = vision.Ball("红球", (700.0, 500.0), r)
+    tracker = snooker.TurnTracker()
+
+    assert tracker.toggle_red_color([]) == "color"
+    assert tracker.toggle_red_color([]) == "red"
+    assert tracker.toggle_red_color([]) == "color"
+    assert tracker.update([cue, red], stable=True) == "color"
+
+
+def test_clearance_color_order_advances_after_ball_is_removed(monkeypatch):
+    """清彩阶段只按黄→绿→棕顺序，黄进袋后下一杆才到绿球。"""
+    cfg = config.Config(allow_kicks=False)
+    r = cfg.ball_radius_ratio * W
+    cue = vision.Ball("白球", (300.0, 500.0), r)
+    yellow = vision.Ball("黄球", (700.0, 500.0), r)
+    green = vision.Ball("绿球", (1000.0, 500.0), r)
+    brown = vision.Ball("棕球", (1300.0, 500.0), r)
+    shot = _stub_shot(10.0, 100.0, 500.0)
+    monkeypatch.setattr(snooker, "_plan", lambda *_args: [shot])
+    pockets = physics.default_pockets(W, H)
+    tracker = snooker.TurnTracker()
+
+    first = [cue, yellow, green, brown]
+    assert tracker.update(first, stable=True) == "clear"
+    target, _, _ = snooker.choose_target(
+        first, cue, pockets, r, W, H, cfg, ball_on=tracker.ball_on)
+    assert target is yellow
+
+    second = [cue, green, brown]
+    assert tracker.update(second, stable=True) == "clear"
+    target, _, _ = snooker.choose_target(
+        second, cue, pockets, r, W, H, cfg, ball_on=tracker.ball_on)
+    assert target is green
+
+
+def test_q_color_mode_selects_best_available_color(monkeypatch):
+    """Q 切到彩球时，红球仍在，按自动优先级选择可行彩球。"""
+    cfg = config.Config(allow_kicks=False)
+    r = cfg.ball_radius_ratio * W
+    cue = vision.Ball("白球", (300.0, 500.0), r)
+    yellow = vision.Ball("黄球", (1700.0, 500.0), r)
+    green = vision.Ball("绿球", (700.0, 500.0), r)
+    shot = _stub_shot(10.0, 100.0, 500.0)
+    monkeypatch.setattr(snooker, "_plan", lambda *_args: [shot])
+
+    target, selected_phase, _ = snooker.choose_target(
+        [cue, yellow, green], cue, physics.default_pockets(W, H), r, W, H,
+        cfg, ball_on="color")
+
+    assert selected_phase == "color"
+    assert target is green
+
+
 def test_snooker_decision_color_order():
     """清彩阶段：按 黄→绿→棕→蓝→粉→黑 顺序。"""
     cfg = config.Config()
