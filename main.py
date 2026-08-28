@@ -9,7 +9,7 @@
 
 热键（Overlay 窗口激活时）：
   1-6 选择袋口 · 0 自动选袋口 · G 点选目标球 · M 手动录入(母球→目标球→袋口) · R 框选球桌区域
-  K 库边解围开关 · P 自动袋口开关 · Q 红/彩切换 · X 鼠标穿透开关 · T 隐藏/显示 · C 重新识别 · Esc 退出
+  K 库边解围开关 · P 自动袋口开关 · Q 下一杆打彩球 · X 鼠标穿透开关 · T 隐藏/显示 · C 重新识别 · Esc 退出
 """
 from __future__ import annotations
 
@@ -116,10 +116,10 @@ except ModuleNotFoundError as exc:
         "请在项目目录运行: python -m pip install -r requirements.txt"
     )
 
-APP_VERSION = "3.6.4"
+APP_VERSION = "3.7.0"
 
 HELP_TEXT = ("1-6 选袋口 | 0 自动 | G 点选目标球 | M 手动录入 | R 框选区域 | K 库边解围 | "
-             "Q 红/彩切换 | O 兼容切换 | P 自动袋口 | B 球标注 | X 穿透 | T 隐藏 | C 重识别 | Esc 退出")
+             "Q 下一杆打彩球 | O 兼容键 | P 自动袋口 | B 球标注 | X 穿透 | T 隐藏 | C 重识别 | Esc 退出")
 
 COLOR_HEX = {
     "白球": "#ebebef",
@@ -1524,17 +1524,20 @@ class App:
         self._redetect()
 
     def _key_toggle_turn(self) -> None:
-        """Q/O：红球阶段手动切换红/彩球权（O 为旧版兼容热键）。
+        """Q：一次性脉冲——下一杆改瞄彩球，该杆打完自动回落瞄红球。
 
-        换手/失误无法可靠地由单帧视觉判断，允许用户显式切换当前球权。
+        视觉无法可靠判断「进红/换手」，红后该打彩球时由用户一键控制。
+        O 键保留同一入口（旧版兼容）。
         """
         balls = [type("BallRef", (), {"label": b.get("label")})()
                  for b in self.scene.get("balls", [])]
-        ball_on = self.turn_tracker.toggle_red_color(balls)
-        self.scene["hint"] = ("规则状态：打红球（Q 可切换为彩球）" if ball_on == "red"
-                              else "规则状态：红球后选彩球（Q 可切回红球）"
-                              if ball_on == "color"
-                              else "规则状态：清彩顺序 黄→绿→棕→蓝→粉→黑")
+        ball_on = self.turn_tracker.pulse_color(balls)
+        if ball_on == "color":
+            self.scene["hint"] = "下一杆：打彩球（任选，该杆打完自动回红球）"
+        elif ball_on == "red":
+            self.scene["hint"] = "规则状态：打红球（打进红后按 Q 切彩球）"
+        else:
+            self.scene["hint"] = "规则状态：清彩顺序 黄→绿→棕→蓝→粉→黑"
         self._redetect()
 
     def _key_toggle_click_through(self) -> None:

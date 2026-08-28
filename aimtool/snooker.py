@@ -24,168 +24,68 @@ VALUE_LABEL = {v: k for k, v in COLOR_VALUE.items()}
 
 @dataclass
 class TurnTracker:
-    """跨稳定局面维护当前允许击打的球类。
+    """红/彩目标策略（v3.7 起人工驱动，不再猜状态）。
 
-    单帧看到红球并不代表本杆必须打红球：刚进红后应任选彩球。视觉
-    无法可靠地从“未进球/对方换手”中推断球权，因此在这种歧义下保留
-    手动切换入口，而不是假装能从一张截图知道游戏内部状态。
+    视觉无法可靠区分「进红 / 没进球 / 犯规换手」，此前基于球数事件的
+    状态推断连出一串误判。新策略把歧义交给用户一键控制：
+
+    * 无人工干预：一律瞄红球；
+    * 红球清完：自动进入严格清彩顺序（黄→绿→棕→蓝→粉→黑，硬规则）；
+    * Q 键 = 一次性脉冲：下一杆改瞄彩球（红后任选，自动挑最佳彩球），
+      这一杆打完（球动过又恢复稳定）自动回落瞄红球。
+
+    时序细节：打进红球后球还在滚时按 Q 是最常见的按法，脉冲必须
+    存活到「下一杆」结束 —— 用 _pulse_pending 区分「按下 Q 时球
+    正在动」：先等当前这杆结束（不清脉冲），再等脉冲杆结束才回落。
     """
 
-    ball_on: Optional[str] = None  # red / color / clear
-    _reds: Optional[int] = None
-    _colors: Optional[int] = None
-    # Q/O is a session override, separate from the visual rule inference.  A
-    # A stable frame with the same ball counts must not undo a user's toggle;
-    # the override is released when the visible ball counts actually change.
-    _manual_ball_on: Optional[str] = None
-    _manual_counts: Optional[Tuple[int, int]] = None
-    # 击杆周期感知：台面从稳定进入非稳定（球在动）即一杆开始，恢复稳
-    # 定时若球数与杆前相同＝这杆没进球。视觉无法区分「还没打」与「打
-    # 了没进」，但 MOVING→READY 周期本身就是「打过一杆」的证据，必须
-    # 据此推进状态，否则红后彩球没进会永远停在「任选彩球」（跳过黄
-    # 球直接磁切角好的绿球）。
-    _pending_shot: bool = False
-    _pre_shot_counts: Optional[Tuple[int, int]] = None
-    # 红球数识别偶发 ±1 抖动（球架遮挡）：单帧减少不确认，连续两个稳
-    # 定帧仍少才切换到红后彩球；确认前不同步基线，避免基线被低值污
-    # 染后真进球再也触发不了。
-    _red_drop: int = 0
+    ball_on: Optional[str] = None      # red / color / clear
+    _color_pulse: bool = False         # Q 脉冲：下一杆瞄彩球
+    _pulse_pending: bool = False       # 按下 Q 时球正在动：先等这杆结束
+    _pending_shot: bool = False        # 击杆周期：球动过 = 打过一杆
 
     def reset(self) -> None:
         self.ball_on = None
-        self._reds = None
-        self._colors = None
-        self._manual_ball_on = None
-        self._manual_counts = None
+        self._color_pulse = False
+        self._pulse_pending = False
         self._pending_shot = False
-        self._pre_shot_counts = None
-        self._red_drop = 0
 
     def update(self, balls: Sequence, stable: bool) -> str:
         reds = reds_remaining(balls)
-        colors = sum(1 for b in balls if b.label in COLOR_ORDER)
         if not stable:
-            if self._reds is not None and not self._pending_shot:
-                self._pre_shot_counts = (self._reds, self._colors or 0)
             self._pending_shot = True
-            return self.ball_on or ("clear" if reds == 0 else "red")
-
-        counts = (reds, colors)
+            return self.ball_on or "red"
         if self._pending_shot:
-            # 一杆结束（MOVING/STABILIZING → READY）。球数与杆前相同＝
-            # 这一杆没进球：
-            #   * 红后任选彩球没进 → 红球还在则换手打红；红球已清则
-            #     进入严格清彩顺序；
-            #   * 红球/清彩阶段没进 → 本来就继续打同类，无需变化。
-            # Q 手动覆盖期间不推进（用户明确指定的状态优先）。
+            # 一杆结束（MOVING/STABILIZING → READY）。
             self._pending_shot = False
-            if (self._pre_shot_counts is not None
-                    and counts == self._pre_shot_counts
-                    and self._manual_ball_on is None
-                    and self.ball_on == "color"):
-                self.ball_on = "red" if reds > 0 else "clear"
-            self._pre_shot_counts = None
-
-        # 新局检测：清彩阶段台面不应有红球；红后任选阶段红球一杆最多
-        # 少 1-2 颗、绝不会大增。红球重新出现/大增必然是「新开一把」，
-        # 旧状态全部作废回到红球阶段 —— 否则残留的 clear 会让清彩
-        # 分支只盯黄球，黄球被彩球堆挡住时报全程无可行方案。
-        if (self._manual_ball_on is None
-                and self._reds is not None
-                and ((self.ball_on == "clear" and reds > 0)
-                     or (self.ball_on == "color" and reds - self._reds >= 3))):
-            self.ball_on = "red"
-
-        if self._manual_ball_on is not None:
-            counts = (reds, colors)
-            if reds == 0:
-                self._manual_ball_on = None
-                self._manual_counts = None
-                if self._reds is None:
-                    # Q pressed before the first frame, and that first frame
-                    # is already a clear-colour position.
-                    self.ball_on = "clear"
-                    self._reds, self._colors = counts
-                    return self.ball_on
-            elif self._manual_counts is None:
-                # Q may have been pressed before the first stable detection.
-                self._manual_counts = counts
-            elif counts != self._manual_counts:
-                # A real ball-count change marks the end of the one-shot user
-                # override; resume the normal red-after-pot/color progression.
-                self._manual_ball_on = None
-                self._manual_counts = None
+            if self._pulse_pending:
+                # 这是「按下 Q 时正在滚的那杆」的结束：脉冲才刚生效，
+                # 不在本杆回落。
+                self._pulse_pending = False
             else:
-                self.ball_on = self._manual_ball_on
-                self._reds, self._colors = counts
-                return self.ball_on
-
-        if self._reds is None:
-            # Q 可能在首个稳定帧前按下；已有手动状态时保留它，
-            # 否则按当前台面初始化默认状态。
-            if self.ball_on is None:
-                self.ball_on = "clear" if reds == 0 else "red"
-        elif reds < self._reds:
-            # 红球数减少（包括最后一颗红球）后，下一杆都必须先选彩球。
-            # 不能在 reds==0 时直接进入 clear，否则会跳过最后一颗红后的
-            # 任选彩球阶段。单帧减少不算：连续两个稳定帧仍少才确认，
-            # 确认前不同步基线，防止遮挡抖动把基线拉低后真进球失灵。
-            if self._red_drop + 1 >= 2:
-                self.ball_on = "color"
-                self._red_drop = 0
-            else:
-                self._red_drop += 1
-                return self.ball_on or "red"
-        elif self.ball_on == "color" and colors < (self._colors or 0):
-            # 颜色在进红后的当前杆被打掉（短暂未复位的画面）。
-            self.ball_on = "red" if reds > 0 else "clear"
-        elif reds == 0 and self.ball_on is None:
-            self.ball_on = "clear"
-        elif self.ball_on is None:
-            self.ball_on = "red"
-        self._reds, self._colors = reds, colors
-        self._red_drop = 0
-        return self.ball_on or "red"
-
-    def cycle_manual(self, balls: Sequence) -> str:
-        """手动切换红球/彩球目标，并同步当前画面的计数基线。
-
-        视觉只能看到球是否还在台面上，不能知道上一杆是未进球、犯规还是
-        成功入袋。同步 ``_reds``/``_colors`` 很重要：否则在首次识别完成前
-        按键，下一次 ``update`` 会把刚切换的状态重新初始化掉。
-        """
-        if balls:
-            reds = reds_remaining(balls)
-            colors = sum(1 for b in balls if b.label in COLOR_ORDER)
-        else:
-            # 识别线程可能正处于稳定确认/换帧窗口，使用最近一次可靠计数，
-            # 不让一次空场景把 Q 的即时切换错误地变成清彩阶段。
-            reds = self._reds
-            colors = self._colors or 0
+                self._color_pulse = False   # 脉冲杆打完，回落瞄红球
         if reds == 0:
-            self.ball_on = "clear"
-            self._manual_ball_on = None
-            self._manual_counts = None
-            if balls:
-                self._reds, self._colors = reds, colors
-            return self.ball_on
-
-        current = self.ball_on if self.ball_on in ("red", "color") else "red"
-        self._manual_ball_on = "color" if current == "red" else "red"
-        self._manual_counts = ((reds, colors) if balls or self._reds is not None
-                               else None)
-        self.ball_on = self._manual_ball_on
-        if balls:
-            self._reds, self._colors = reds, colors
+            # 红球清完默认严格清彩（硬规则）；Q 脉冲可覆盖一杆——
+            # 真实规则里「最后一颗红后那一杆」本就是任选彩球。
+            self.ball_on = "color" if self._color_pulse else "clear"
+        elif self._color_pulse:
+            self.ball_on = "color"
+        else:
+            self.ball_on = "red"
         return self.ball_on
 
-    def toggle_red_color(self, balls: Sequence) -> str:
-        """Q 键入口：红球仍在时，在红球与红后选彩之间切换。
+    def pulse_color(self, balls: Sequence) -> str:
+        """Q 键入口：下一杆改瞄彩球（任选）；打完该杆自动回落。
 
-        无红球时不能回到红球目标，始终保持清彩阶段的严格顺序。
-        ``cycle_manual`` 保留为旧 O 键的兼容入口。
+        红球还在：覆盖默认的红球目标（打进红后的那一杆）。
+        红球已清：覆盖清彩顺序一杆 —— 真实规则里「最后一颗红后
+        的那一杆」本就是任选彩球，此后恢复严格顺序。
         """
-        return self.cycle_manual(balls)
+        self._color_pulse = True
+        # 按下时球正在滚（刚打进红）→ 等这杆结束才算脉冲杆开始。
+        self._pulse_pending = self._pending_shot
+        self.ball_on = "color"
+        return self.ball_on
 
 
 def phase(balls: Sequence) -> str:

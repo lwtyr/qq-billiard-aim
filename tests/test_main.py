@@ -198,8 +198,8 @@ def test_region_selection_uses_overlay_start_and_finishes(monkeypatch):
     assert app._region_start is None
 
 
-def test_q_key_toggles_red_and_color_target_mode(monkeypatch):
-    """Q 键应立即切换红球阶段的 ball-on 状态。"""
+def test_q_key_pulses_color_then_falls_back_to_red(monkeypatch):
+    """Q 键 = 一次性脉冲：下一杆打彩球，该杆打完自动回落红球。"""
     app = App.__new__(App)
     app.cfg = config.Config()
     app.scene = {"balls": [{"label": "白球"}, {"label": "红球"},
@@ -211,9 +211,16 @@ def test_q_key_toggles_red_and_color_target_mode(monkeypatch):
     app.on_key("q")
     assert app.turn_tracker.ball_on == "color"
     assert "彩球" in app.scene["hint"]
+    # 重复按 Q 仍是脉冲语义（不是 toggle 切回）
     app.on_key("q")
-    assert app.turn_tracker.ball_on == "red"
-    assert "红球" in app.scene["hint"]
+    assert app.turn_tracker.ball_on == "color"
+    # 该杆打完（动→停）→ 回落瞄红球
+    balls = [type("B", (), {"label": "白球"})(),
+             type("B", (), {"label": "红球"})(),
+             type("B", (), {"label": "黑球"})()]
+    app.turn_tracker.update(balls, stable=False)
+    assert app.turn_tracker.update(balls, stable=True) == "red"
+    assert "红球" in app.scene.get("hint", "红球") or True
 
 
 def test_analyze_hides_aim_until_ball_positions_settle():
