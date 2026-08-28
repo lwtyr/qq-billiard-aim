@@ -298,6 +298,14 @@ def kick_shot(cue: Point, target: Point, pocket: Point, r: float,
     if d is None:
         return Shot(pocket, g, (0.0, 0.0), 0.0, 0.0, 0.0, 0.0, False, rail_seq=tuple(rails))
 
+    # 第一库几何快速剪枝：初速度方向背离首库时，物理上必不可能优先触碰该库
+    r0 = rails[0]
+    if (r0 == "top" and d[1] >= 0) or \
+       (r0 == "bottom" and d[1] <= 0) or \
+       (r0 == "left" and d[0] >= 0) or \
+       (r0 == "right" and d[0] <= 0):
+        return Shot(pocket, g, (0.0, 0.0), 0.0, 0.0, 0.0, 0.0, False, rail_seq=tuple(rails))
+
     # 实空间仿真：记录真实反弹点与反弹序列。
     # 每步先检查「当前射线是否穿过鬼球」——这是到达判定：原实现缺少该
     # 检查，最后一库后轨迹明明穿过鬼球，循环却继续记录多余反弹，
@@ -316,7 +324,12 @@ def kick_shot(cue: Point, target: Point, pocket: Point, r: float,
                 arrived = True
                 break
         best_t, best_rail = None, None
-        for rail in RAILS:
+        # 仅检测射线运动方向可能迎面相交的两条库边（水平+垂直各一），避免无谓遍历反向库边
+        r_h = "right" if vel[0] > 1e-12 else ("left" if vel[0] < -1e-12 else None)
+        r_v = "bottom" if vel[1] > 1e-12 else ("top" if vel[1] < -1e-12 else None)
+        for rail in (r_h, r_v):
+            if rail is None:
+                continue
             t = ray_rail_t(pos, vel, rail, w, h, rail_inset)
             if t is not None and (best_t is None or t < best_t):
                 best_t, best_rail = t, rail

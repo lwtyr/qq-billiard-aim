@@ -227,22 +227,42 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
             selected_on = "clear" if not any(
                 b.label in COLOR_ORDER for b in balls) else "color"
         else:
+            import copy
+            use_kicks = bool(getattr(cfg, "allow_kicks", True))
+            cfg_fast = copy.copy(cfg)
+            cfg_fast.allow_kicks = False if use_kicks else cfg.allow_kicks
+
             best: Optional[Tuple[Tuple[float, ...], object]] = None
+            # 第一阶段：极速扫描所有红球的直球路线（纯直球耗时 <1ms）
             for tb in reds:
                 plans = _plan(cue, tb, pockets, r, w, h,
-                              _others(balls, cue, tb), cfg)
+                              _others(balls, cue, tb), cfg_fast)
                 shot = best_target_shot(plans)
                 if shot is None:
                     continue
                 key = target_shot_key(shot)
                 if prefer is not None:
-                    # 只在前面的规则完全打平时保持上一颗目标，减少识别
-                    # 噪声造成的跳变；距离放在规则键之后，不改变优先级。
                     key = key + (physics.dist(tb.pos, prefer),)
                 else:
                     key = key + (float(tb.pos[0]), float(tb.pos[1]))
                 if best is None or key < best[0]:
                     best = (key, tb)
+
+            # 第二阶段：仅当全部红球均无直球可行路线且开启库边时，才回退到全量库边反弹扫描
+            if best is None and use_kicks:
+                for tb in reds:
+                    plans = _plan(cue, tb, pockets, r, w, h,
+                                  _others(balls, cue, tb), cfg)
+                    shot = best_target_shot(plans)
+                    if shot is None:
+                        continue
+                    key = target_shot_key(shot)
+                    if prefer is not None:
+                        key = key + (physics.dist(tb.pos, prefer),)
+                    else:
+                        key = key + (float(tb.pos[0]), float(tb.pos[1]))
+                    if best is None or key < best[0]:
+                        best = (key, tb)
             if best is not None:
                 n = reds_remaining(balls)
                 return best[1], "red", f"红球阶段（剩 {n} 颗红球）：打红球"
@@ -251,10 +271,16 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
         # 红球仍在时，红后彩球是任选目标；按自动选球优先级在所有
         # 彩球中挑选。红球清完后会由 clear 状态进入严格清彩顺序。
         colors = [b for b in balls if b.label in COLOR_ORDER]
+        import copy
+        use_kicks = bool(getattr(cfg, "allow_kicks", True))
+        cfg_fast = copy.copy(cfg)
+        cfg_fast.allow_kicks = False if use_kicks else cfg.allow_kicks
+
         best: Optional[Tuple[Tuple[float, ...], object]] = None
+        # 第一阶段：极速扫描所有彩球直球
         for tb in colors:
             plans = _plan(cue, tb, pockets, r, w, h,
-                          _others(balls, cue, tb), cfg)
+                          _others(balls, cue, tb), cfg_fast)
             shot = best_target_shot(plans)
             if shot is None:
                 continue
@@ -265,6 +291,22 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
                 key = key + (float(tb.pos[0]), float(tb.pos[1]))
             if best is None or key < best[0]:
                 best = (key, tb)
+
+        # 第二阶段：无直球时回退库边
+        if best is None and use_kicks:
+            for tb in colors:
+                plans = _plan(cue, tb, pockets, r, w, h,
+                              _others(balls, cue, tb), cfg)
+                shot = best_target_shot(plans)
+                if shot is None:
+                    continue
+                key = target_shot_key(shot)
+                if prefer is not None:
+                    key = key + (physics.dist(tb.pos, prefer),)
+                else:
+                    key = key + (float(tb.pos[0]), float(tb.pos[1]))
+                if best is None or key < best[0]:
+                    best = (key, tb)
         if best is not None:
             return best[1], "color", f"红后任选彩球：打{best[1].label}"
         return None, "color", "红后任选彩球：所有彩球暂无可行方案"
