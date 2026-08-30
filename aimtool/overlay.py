@@ -272,7 +272,7 @@ class Overlay:
     _HOTKEYS = {
         "1": "1", "2": "2", "3": "3", "4": "4", "5": "5", "6": "6",
         "0": "0", "g": "g", "m": "m", "r": "r", "k": "k", "p": "p", "o": "o", "b": "b",
-        "x": "x", "t": "t", "c": "c", "q": "q",
+        "x": "x", "t": "t", "c": "c", "q": "q", "w": "w",
     }
     _VK_EXTRA = {0x1B: "escape", 0x7B: "f12"}
 
@@ -614,10 +614,8 @@ class Overlay:
                               b["x"] + r * 1.5, b["y"] + r * 1.5,
                               outline=C_AIM, width=2)
             elif is_tgt:
-                # 目标球：亮橙外圈（不填充，不挡球）
-                c.create_oval(b["x"] - r * 1.5, b["y"] - r * 1.5,
-                              b["x"] + r * 1.5, b["y"] + r * 1.5,
-                              outline=C_TARGET, width=3)
+                # 目标球亮橙外圈隐藏；contact 小点仍在下方单独绘制。
+                pass
             elif self._show_balls:
                 # 全标注模式：细空心小圆
                 c.create_oval(b["x"] - r * 0.6, b["y"] - r * 0.6,

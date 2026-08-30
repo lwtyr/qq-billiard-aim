@@ -43,12 +43,14 @@ class TurnTracker:
     _color_pulse: bool = False         # Q 脉冲：下一杆瞄彩球
     _pulse_pending: bool = False       # 按下 Q 时球正在动：先等这杆结束
     _pending_shot: bool = False        # 击杆周期：球动过 = 打过一杆
+    _force_red: bool = False           # W 强制保持红球目标，直到 Q 或重置
 
     def reset(self) -> None:
         self.ball_on = None
         self._color_pulse = False
         self._pulse_pending = False
         self._pending_shot = False
+        self._force_red = False
 
     def update(self, balls: Sequence, stable: bool) -> str:
         reds = reds_remaining(balls)
@@ -64,7 +66,9 @@ class TurnTracker:
                 self._pulse_pending = False
             else:
                 self._color_pulse = False   # 脉冲杆打完，回落瞄红球
-        if reds == 0:
+        if self._force_red:
+            self.ball_on = "red"
+        elif reds == 0:
             # 红球清完默认严格清彩（硬规则）；Q 脉冲可覆盖一杆——
             # 真实规则里「最后一颗红后那一杆」本就是任选彩球。
             self.ball_on = "color" if self._color_pulse else "clear"
@@ -81,10 +85,19 @@ class TurnTracker:
         红球已清：覆盖清彩顺序一杆 —— 真实规则里「最后一颗红后
         的那一杆」本就是任选彩球，此后恢复严格顺序。
         """
+        self._force_red = False
         self._color_pulse = True
         # 按下时球正在滚（刚打进红）→ 等这杆结束才算脉冲杆开始。
         self._pulse_pending = self._pending_shot
         self.ball_on = "color"
+        return self.ball_on
+
+    def pulse_red(self) -> str:
+        """W键入口：强制切回红球，取消彩球脉冲"""
+        self._color_pulse = False
+        self._pulse_pending = False
+        self._force_red = True
+        self.ball_on = "red"
         return self.ball_on
 
 

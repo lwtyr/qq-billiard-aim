@@ -383,8 +383,8 @@ class NativeLayer:
                 e = r * 1.5
                 d.ellipse([x - e, y - e, x + e, y + e], outline=C_AIM, width=2)
             elif is_tgt:
-                e = r * 1.5
-                d.ellipse([x - e, y - e, x + e, y + e], outline=C_TARGET, width=3)
+                # 目标球亮橙外圈隐藏；contact 小点仍在下方单独绘制。
+                pass
 
         # 鬼球（绿色虚线圆 + 中心十字）—— 唯一瞄准目标：白球中心
         # 要穿过虚线圆的圆心，而不是打目标球表面上的点。

@@ -95,3 +95,28 @@ def test_reset_clears_pulse():
     assert t.ball_on == "color"
     t.reset()
     assert t.update(balls, stable=True) == "red"
+
+
+def test_w_pulse_forces_red_and_clears_pending_color_pulse():
+    """W 强制切回红球，并取消当前及待生效的彩球脉冲。"""
+    t = snooker.TurnTracker()
+    balls = _balls(reds=5)
+    t.update(balls, stable=False)
+    assert t.pulse_color(balls) == "color"
+    assert t.pulse_red() == "red"
+    assert t._color_pulse is False
+    assert t._pulse_pending is False
+    assert t.update(balls, stable=True) == "red"
+
+
+def test_w_pulse_keeps_red_when_no_reds_are_detected():
+    """W remains effective even when update would otherwise enter clearance."""
+    t = snooker.TurnTracker()
+    clear_balls = _balls(reds=0, colors=("黄球", "黑球"))
+    assert t.update(clear_balls, stable=True) == "clear"
+    assert t.pulse_red() == "red"
+    assert t.update(clear_balls, stable=True) == "red"
+    assert t.update(clear_balls, stable=False) == "red"
+    assert t.update(clear_balls, stable=True) == "red"
+    t.pulse_color(clear_balls)
+    assert t.update(clear_balls, stable=True) == "color"

@@ -116,10 +116,11 @@ except ModuleNotFoundError as exc:
         "请在项目目录运行: python -m pip install -r requirements.txt"
     )
 
-APP_VERSION = "3.8.1"
+APP_VERSION = "3.8.2"
 
 HELP_TEXT = ("1-6 选袋口 | 0 自动 | G 点选目标球 | M 手动录入 | R 框选区域 | K 库边解围 | "
-             "Q 下一杆打彩球 | O 兼容键 | P 自动袋口 | B 球标注 | X 穿透 | T 隐藏 | C 重识别 | Esc 退出")
+             "Q 下一杆打彩球 | O 兼容键 | W 切回红球 | P 自动袋口 | B 球标注 | X 穿透 | "
+             "T 隐藏 | C 重识别 | Esc 退出")
 
 COLOR_HEX = {
     "白球": "#ebebef",
@@ -956,7 +957,7 @@ def _stage_targets(ctx: _AnalysisContext) -> Optional[Dict]:
         contact_s = (vision.point_table_to_screen(contact_t, Hinv)
                      if contact_t is not None else target_s)
         scene["segments"] = [
-            {"pts": [cue_s, ghost_s], "color": "#22c55e", "width": 6},
+            {"pts": [cue_s, ghost_s], "color": "#22c55e", "width": 2},
             {"pts": [ghost_s, target_s], "color": "#f97316", "width": 5,
              "dash": True},
         ]
@@ -1107,7 +1108,7 @@ def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
         path_s.append(ghost_s)
         segs.append({"pts": path_s, "color": "#38bdf8", "width": 5, "dash": False})
     else:
-        segs.append({"pts": [cue_s, ghost_s], "color": "#22c55e", "width": 6})
+        segs.append({"pts": [cue_s, ghost_s], "color": "#22c55e", "width": 2})
     segs.append({"pts": [ghost_s, target_s], "color": "#f97316", "width": 5, "dash": True})
     segs.append({"pts": [target_s, pocket_s], "color": "#facc15", "width": 4, "dash": True})
     # 白球切线轨迹：碰后母球沿切线方向滚动；指向袋口（摔袋）时用红色警示
@@ -1486,6 +1487,8 @@ class App:
             "p": self._key_toggle_auto_pocket,
             "q": self._key_toggle_turn,
             "o": self._key_toggle_turn,
+            "w": self._key_switch_to_red,
+            "W": self._key_switch_to_red,
             "x": self._key_toggle_click_through,
             "t": self._key_toggle_overlay,
             "b": self._key_toggle_balls,
@@ -1605,6 +1608,14 @@ class App:
             self.scene["hint"] = "规则状态：打红球（打进红后按 Q 切彩球）"
         else:
             self.scene["hint"] = "规则状态：清彩顺序 黄→绿→棕→蓝→粉→黑"
+        self._redetect()
+
+    def _key_switch_to_red(self) -> None:
+        """W：强制切回红球，取消Q的彩球脉冲"""
+        balls = [type("BallRef", (), {"label": b.get("label")})()
+                 for b in self.scene.get("balls", [])]
+        ball_on = self.turn_tracker.pulse_red()
+        self.scene["hint"] = "已切换：打红球（按Q切彩球）"
         self._redetect()
 
     def _key_toggle_click_through(self) -> None:
