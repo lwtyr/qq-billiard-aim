@@ -75,6 +75,14 @@ def test_no_reds_defaults_to_strict_clearance():
                     stable=True) == "clear"
 
 
+def test_next_color_uses_first_color_in_clearance_order():
+    """清彩目标始终取黄→绿→棕→蓝→粉→黑中第一颗在场彩球。"""
+    balls = _balls(reds=0, colors=("黑球", "蓝球", "黄球", "粉球"))
+    assert snooker.next_color(balls).label == "黄球"
+    balls = _balls(reds=0, colors=("黑球", "粉球", "蓝球"))
+    assert snooker.next_color(balls).label == "蓝球"
+
+
 def test_q_pulse_without_reds_allows_one_free_color_shot():
     """最后一颗红后的那一杆本就是任选彩球：Q 脉冲在无红球时覆盖清彩一杆。"""
     t = snooker.TurnTracker()
@@ -109,14 +117,33 @@ def test_w_pulse_forces_red_and_clears_pending_color_pulse():
     assert t.update(balls, stable=True) == "red"
 
 
-def test_w_pulse_keeps_red_when_no_reds_are_detected():
-    """W remains effective even when update would otherwise enter clearance."""
+def test_w_pulse_returns_to_clearance_when_no_reds_remain():
+    """W 只在仍有红球时生效；红球清完后自动回到严格清彩。"""
     t = snooker.TurnTracker()
     clear_balls = _balls(reds=0, colors=("黄球", "黑球"))
     assert t.update(clear_balls, stable=True) == "clear"
     assert t.pulse_red() == "red"
-    assert t.update(clear_balls, stable=True) == "red"
-    assert t.update(clear_balls, stable=False) == "red"
-    assert t.update(clear_balls, stable=True) == "red"
-    t.pulse_color(clear_balls)
-    assert t.update(clear_balls, stable=True) == "color"
+    assert t.update(clear_balls, stable=True) == "clear"
+    assert t._force_red is False
+
+
+def test_w_pulse_forces_red_until_reds_are_gone():
+    """W 在仍有红球时强制红球，红球清完的下一次更新进入清彩。"""
+    t = snooker.TurnTracker()
+    red_balls = _balls(reds=2, colors=("黄球", "黑球"))
+    assert t.pulse_red() == "red"
+    assert t.update(red_balls, stable=True) == "red"
+    assert t._force_red is True
+    assert t.update(_balls(reds=0, colors=("黄球", "黑球")), stable=True) == "clear"
+    assert t._force_red is False
+
+
+def test_q_pulse_in_clearance_recovers_to_clear():
+    """Q 在清彩阶段只覆盖一杆，击杆结束后恢复严格清彩。"""
+    t = snooker.TurnTracker()
+    balls = _balls(reds=0, colors=("黄球", "绿球", "黑球"))
+    assert t.update(balls, stable=True) == "clear"
+    assert t.pulse_color(balls) == "color"
+    assert t.update(balls, stable=True) == "color"
+    assert t.update(balls, stable=False) == "color"
+    assert t.update(balls, stable=True) == "clear"

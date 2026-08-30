@@ -67,7 +67,12 @@ class TurnTracker:
             else:
                 self._color_pulse = False   # 脉冲杆打完，回落瞄红球
         if self._force_red:
-            self.ball_on = "red"
+            if reds > 0:
+                self.ball_on = "red"
+            else:
+                # 红球已清，W 的强制红球状态不应阻塞严格清彩。
+                self._force_red = False
+                self.ball_on = "color" if self._color_pulse else "clear"
         elif reds == 0:
             # 红球清完默认严格清彩（硬规则）；Q 脉冲可覆盖一杆——
             # 真实规则里「最后一颗红后那一杆」本就是任选彩球。
