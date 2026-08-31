@@ -53,6 +53,15 @@ def test_ghost_near_pocket_passes():
     assert physics.pocket_entry_ok(shot, 1000.0, 500.0, 21.0)
 
 
+def test_inset_pocket_still_uses_entry_angle_filter():
+    """袋口精修/偏移后仍应按中袋入射角过滤，而不是被当作台内点放行。"""
+    target, pocket, r = (305.0, 77.0), (500.0, 18.0), 21.0
+    cue = _straight_cue(target, pocket, r)
+    shot = physics.direct_shot(cue, target, pocket, r)
+    assert physics.pocket_entry_cos(shot, 1000.0, 500.0, 21.0) < 0.55
+    assert not physics.pocket_entry_ok(shot, 1000.0, 500.0, 21.0)
+
+
 def test_plan_shots_filters_mid_pocket():
     """plan_shots 集成：中袋大斜角路线被淘汰，同场景角袋路线保留。"""
     w, h, r = 1000.0, 500.0, 21.0

@@ -1134,6 +1134,23 @@ def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
         "target_radius": float(target_radius),
         "pocket": {"x": pocket_s[0], "y": pocket_s[1]},
     }
+    # 精度诊断：这些量使用与规划完全相同的台面坐标，便于把“模型不
+    # 推荐”与“用户严格对准仍打偏”分开。radius_error 不是球心真值，
+    # 而是当前帧半径相对配置基准的偏差；真实误差需由进球反馈标定。
+    entry_cos = physics.pocket_entry_cos(shot, W, H, r)
+    entry_limit = physics.pocket_entry_limit(shot, W, H, r)
+    radius_reference = float(cfg.ball_radius_ratio * W)
+    radius_error = float(r - radius_reference)
+    scene["aim_geometry"].update({
+        "ball_radius": float(r),
+        "ball_radius_reference": radius_reference,
+        "ball_radius_error": radius_error,
+        "ball_radius_error_pct": (100.0 * radius_error / radius_reference
+                                   if radius_reference > 1e-9 else 0.0),
+        "entry_cos": (float(entry_cos) if entry_cos is not None else None),
+        "entry_cos_min": (float(entry_limit) if entry_limit is not None else None),
+        "aim_offset": [float(ghost_offset[0]), float(ghost_offset[1])],
+    })
     # 唯一瞄准操作指引：白球中心对准虚线圆（鬼球）圆心，沿绿线方向击打。
     # 目标球表面上的点/预测路径不是瞄准目标，对着它们打切角球必偏。
     prev_hint = scene.get("hint", "")
@@ -1149,8 +1166,11 @@ def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
     scene["shot_key"] = {"cue": cue_t, "target": target_t, "pocket": shot.pocket}
 
     blocked = "被挡" if shot.blocked else "通畅"
+    entry_text = (f" | 入射cos {entry_cos:.2f}"
+                  if entry_cos is not None else "")
     scene["status"] = (f"袋口{pidx + 1} | {shot.label} {blocked} | 切角 {shot.cut_deg:.0f}° "
-                       f"| 力度 {power}%")
+                       f"| 力度 {power}% | r {r:.1f}({radius_error:+.1f})"
+                       f"{entry_text}")
     return scene
 
 

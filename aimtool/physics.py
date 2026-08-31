@@ -467,6 +467,46 @@ CORNER_POCKET_MIN_COS = 0.42
 """角袋入射角限制（≤ ≈65°）。角袋沿库边抹进仍可行（cos≈0.7），阈值放宽。"""
 
 
+def pocket_entry_cos(shot: Shot, w: float, h: float,
+                     edge_tolerance: float = 0.0) -> Optional[float]:
+    """Return the signed pocket-entry cosine used by the geometry filter.
+
+    The value is 1 for an approach along the pocket opening normal and 0 for
+    a tangential approach.  ``None`` means this is not one of the standard
+    top/bottom pocket positions, so the entry angle is intentionally not
+    constrained by this model.
+    """
+    p, g = shot.pocket, shot.ghost
+    edge_tolerance = max(0.0, float(edge_tolerance))
+    if not (p[1] <= edge_tolerance or p[1] >= h - edge_tolerance):
+        return None
+    at_top = p[1] <= edge_tolerance
+    if abs(p[0] - w / 2.0) < 0.25 * w:
+        n = (0.0, -1.0 if at_top else 1.0)
+    else:
+        nx = -1.0 if p[0] < w / 2.0 else 1.0
+        ny = -1.0 if at_top else 1.0
+        length = math.hypot(nx, ny)
+        n = (nx / length, ny / length)
+    d = sub(p, g)
+    length = math.hypot(d[0], d[1])
+    if length < 1e-9:
+        return 1.0
+    return clamp((d[0] * n[0] + d[1] * n[1]) / length, -1.0, 1.0)
+
+
+def pocket_entry_limit(shot: Shot, w: float, h: float,
+                       edge_tolerance: float = 0.0,
+                       mid_cos: float = MID_POCKET_MIN_COS,
+                       corner_cos: float = CORNER_POCKET_MIN_COS) -> Optional[float]:
+    """Return the minimum entry cosine, or ``None`` for unconstrained sides."""
+    p = shot.pocket
+    edge_tolerance = max(0.0, float(edge_tolerance))
+    if not (p[1] <= edge_tolerance or p[1] >= h - edge_tolerance):
+        return None
+    return mid_cos if abs(p[0] - w / 2.0) < 0.25 * w else corner_cos
+
+
 def pocket_entry_ok(shot: Shot, w: float, h: float, r: float,
                     mid_cos: float = MID_POCKET_MIN_COS,
                     corner_cos: float = CORNER_POCKET_MIN_COS) -> bool:
@@ -479,24 +519,14 @@ def pocket_entry_ok(shot: Shot, w: float, h: float, r: float,
     p, g = shot.pocket, shot.ghost
     if dist(g, p) < 2.0 * r:
         return True
-    # 只约束上/下长边上的袋口；左右短边无标准袋位，保守放行。
-    if not (p[1] <= r or p[1] >= h - r):
+    # Pocket coordinates are allowed to be inset by calibration offsets.  Use
+    # a radius-sized edge tolerance so a refined pocket at y=1.2r still gets
+    # the same angle filter as the nominal top-edge pocket.
+    limit = pocket_entry_limit(shot, w, h, r, mid_cos, corner_cos)
+    if limit is None:
         return True
-    if abs(p[0] - w / 2.0) < 0.25 * w:      # 中袋（长边中点附近）
-        n = (0.0, -1.0) if p[1] <= r else (0.0, 1.0)
-        cos_min = mid_cos
-    else:                                    # 角袋：法线 = 指向台内的对角方向
-        nx = -1.0 if p[0] < w / 2.0 else 1.0
-        ny = -1.0 if p[1] <= r else 1.0
-        ilen = math.hypot(nx, ny)
-        n = (nx / ilen, ny / ilen)
-        cos_min = corner_cos
-    d = sub(p, g)
-    ilen = math.hypot(d[0], d[1])
-    if ilen < 1e-9:
-        return True
-    cos_in = (d[0] * n[0] + d[1] * n[1]) / ilen
-    return cos_in >= cos_min
+    cos_in = pocket_entry_cos(shot, w, h, r)
+    return cos_in is None or cos_in >= limit
 
 
 def plan_shots(cue: Point, target: Point, pockets: Sequence[Point], r: float,
