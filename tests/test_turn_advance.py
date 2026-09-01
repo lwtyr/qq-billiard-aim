@@ -232,3 +232,66 @@ def test_q_in_clearance_keeps_strict_order_after_shots():
     assert t.update(balls, stable=True) == "clear"
     assert t.pulse_color(balls) == "clear"
     assert t.update(balls, stable=True) == "clear"
+
+
+def test_clearance_target_pinned_through_brief_miss():
+    """清彩滞回：锁定的黄球瞬时漏检 1~4 次目标不变（不跳到绿球）。"""
+    t = snooker.TurnTracker()
+    full = _balls(reds=0, colors=("黄球", "绿球", "黑球"))
+    assert t.update(full, stable=True) == "clear"
+    assert t.clear_target == "黄球"
+    no_yellow = [b for b in full if b.label != "黄球"]
+    for _ in range(4):   # 漏检容差内：保持黄球
+        assert t.update(no_yellow, stable=True) == "clear"
+        assert t.clear_target == "黄球"
+    # 连续第 5 次仍未见：确认落袋，移交绿球
+    assert t.update(no_yellow, stable=True) == "clear"
+    assert t.clear_target == "绿球"
+
+
+def test_clearance_occluded_frames_do_not_burn_miss_budget():
+    """遮挡/零信息帧冻结滞回计数：球杆长时间盖着黄球不会迫使用户换人。"""
+    t = snooker.TurnTracker()
+    full = _balls(reds=0, colors=("黄球", "绿球"))
+    t.update(full, stable=True)
+    assert t.clear_target == "黄球"
+    for _ in range(6):   # 遮挡（黄球被盖住）不消耗漏检预算
+        assert t.update([], stable=False, occluded=True) == "clear"
+    assert t.clear_target == "黄球"
+    assert t.update(full, stable=True) == "clear"
+    assert t.clear_target == "黄球"
+
+
+def test_clearance_target_reclaimed_by_lower_color_with_streak():
+    """锁定绿球期间黄球重新稳定出现 → 按规则夺回黄球（低分优先）。"""
+    t = snooker.TurnTracker()
+    green_only = _balls(reds=0, colors=("绿球", "黑球"))
+    for _ in range(6):
+        t.update(green_only, stable=True)
+    assert t.clear_target == "绿球"
+    full = _balls(reds=0, colors=("黄球", "绿球", "黑球"))
+    assert t.update(full, stable=True) == "clear"
+    assert t.clear_target == "绿球"          # 黄球刚出现 1 次：先不抢
+    assert t.update(full, stable=True) == "clear"
+    assert t.clear_target == "黄球"          # 连续在场 2 次：夺回黄球
+
+
+def test_clearance_pin_resets_on_red_phase():
+    """红球阶段/新开局面：滞回记忆清空，下次清彩从黄球重新锁定。"""
+    t = snooker.TurnTracker()
+    t.update(_balls(reds=0, colors=("绿球", "黑球")), stable=True)
+    assert t.clear_target == "绿球"
+    t.update(_balls(reds=15), stable=True)      # 新局铺红
+    assert t.clear_target is None
+    t.update(_balls(reds=0, colors=("黄球", "绿球")), stable=True)
+    assert t.clear_target == "黄球"
+
+
+def test_reset_clears_clearance_pin():
+    t = snooker.TurnTracker()
+    t.update(_balls(reds=0, colors=("黄球",)), stable=True)
+    assert t.clear_target == "黄球"
+    t.reset()
+    assert t.clear_target is None
+    assert t._clear_missing == 0
+    assert not t._color_streak

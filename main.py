@@ -116,7 +116,7 @@ except ModuleNotFoundError as exc:
         "请在项目目录运行: python -m pip install -r requirements.txt"
     )
 
-APP_VERSION = "3.10.0"
+APP_VERSION = "3.10.1"
 
 HELP_TEXT = ("1-6 选袋口 | 0 自动 | G 点选目标球 | M 手动录入 | R 框选区域 | K 库边解围 | "
              "Q 进红后打彩球 | O 兼容键 | W 切回红球 | P 自动袋口 | B 球标注 | X 穿透 | "
@@ -892,7 +892,11 @@ def _stage_targets(ctx: _AnalysisContext) -> Optional[Dict]:
                         + (b.pos[1] - cue_t[1]) ** 2)
         tb, _phase, rule_text = snooker.choose_target(
             balls_t, cue_b, pockets_t, r, W, H, cfg, prefer=prefer_target,
-            ball_on=ball_on)
+            ball_on=ball_on,
+            clear_target=(turn_tracker.clear_target
+                          if turn_tracker is not None and ball_on == "clear"
+                          else None),
+        )
         target_b = tb
         target_t = tb.pos if tb else None
         if (target_t is None

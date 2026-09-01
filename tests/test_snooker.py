@@ -390,3 +390,29 @@ def test_choose_target_never_breaks_clearance_order_on_stale_state(monkeypatch):
         assert target is yellow, stale
         assert selected_phase == "color"
         assert "清彩" in msg and "任选" not in msg
+
+
+def test_choose_target_honours_pinned_clearance_target(monkeypatch):
+    """清彩锁定目标：在场时一定瞄黄；黄球瞬时漏检帧不出线也不跳绿球。"""
+    cfg = config.Config(allow_kicks=False)
+    r = cfg.ball_radius_ratio * W
+    cue = vision.Ball("白球", (300.0, 500.0), r)
+    yellow = vision.Ball("黄球", (700.0, 500.0), r)
+    green = vision.Ball("绿球", (1000.0, 500.0), r)
+    monkeypatch.setattr(snooker, "_plan",
+                        lambda *_args: [_stub_shot(5.0, 80.0, 400.0)])
+    pockets = physics.default_pockets(W, H)
+
+    target, phase, msg = snooker.choose_target(
+        [cue, yellow, green], cue, pockets, r, W, H, cfg,
+        ball_on="clear", clear_target="黄球")
+    assert target is yellow and "任选" not in msg
+    # 黄球漏检帧：保持锁定（暂不出方案），绝不跳绿球
+    target, phase, msg = snooker.choose_target(
+        [cue, green], cue, pockets, r, W, H, cfg,
+        ball_on="clear", clear_target="黄球")
+    assert target is None and "黄球" in msg and "任选" not in msg
+    # 无锁定（兼容旧调用路径）：按在场最低分直接选（绿球）
+    target, phase, _ = snooker.choose_target(
+        [cue, green], cue, pockets, r, W, H, cfg, ball_on="clear")
+    assert target is green

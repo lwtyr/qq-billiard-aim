@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import ClassVar, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -57,6 +57,11 @@ class TurnTracker:
     _SHOT_MOTION_UNITS: ClassVar[float] = 8.0
     # 连续多少次更新无位移视为一杆结束（30fps 分析下约 67ms 静止）。
     _STILL_UPDATES: ClassVar[int] = 2
+    # 清彩滞回：锁定球连续多少次有效更新未见才移交下一颗；更低分球
+    # 连续在场多少次才夺回目标。防止识别噪声（低分彩球瞬时漏检 /
+    # 唯一色球被重复检测）让清彩目标逐帧跳序。
+    _CLEAR_MISS_TOLERANCE: ClassVar[int] = 4
+    _STREAK_CONFIRM: ClassVar[int] = 2
 
     ball_on: Optional[str] = None      # red / color / clear
     _color_pulse: bool = False         # Q 脉冲：下一杆瞄彩球
@@ -66,6 +71,10 @@ class TurnTracker:
     _still_updates: int = 0            # 连续无位移更新计数
     _ready_hint: bool = True           # 最近一次 update 的画面就绪信号（仅 Q 时序用）
     _prev_points: Optional[Dict[str, List[Tuple[float, float]]]] = None
+    # 清彩目标滞回（v3.10.1）：锁定的当前法定彩球与其漏检计数
+    clear_target: Optional[str] = None
+    _clear_missing: int = 0
+    _color_streak: Dict[str, int] = field(default_factory=dict)
 
     def reset(self) -> None:
         self.ball_on = None
@@ -76,6 +85,7 @@ class TurnTracker:
         self._still_updates = 0
         self._ready_hint = True
         self._prev_points = None
+        self._reset_clearance()
 
     @staticmethod
     def _default_on(reds: int) -> str:
@@ -151,14 +161,54 @@ class TurnTracker:
             self._color_pulse = False
             self._pulse_guard = False
             self._force_red = False
+            self._advance_clearance(balls)
             self.ball_on = "clear"
         elif self._force_red:
             self.ball_on = "red"
+            self._reset_clearance()
         elif self._color_pulse:
             self.ball_on = "color"
+            self._reset_clearance()
         else:
             self.ball_on = "red"
+            self._reset_clearance()
         return self.ball_on
+
+    def _reset_clearance(self) -> None:
+        self.clear_target = None
+        self._clear_missing = 0
+        self._color_streak = {}
+
+    def _advance_clearance(self, balls: Sequence) -> None:
+        """清彩目标滞回：低分彩球瞬时漏检时保持原目标，绝不跳到下一颗。
+
+        * 锁定球仍在场：保持；法规顺序更靠前的球连续在场
+          _STREAK_CONFIRM 次才夺回目标（它只是长时间被挡住，并非不存在）；
+        * 锁定球连续 _CLEAR_MISS_TOLERANCE 次有效更新未见（=真的落袋）
+          才移交下一颗在场最低分球；
+        * 有效更新 = 非遮挡且有检出：遮挡/零信息帧在 update 顶部已被
+          冻结，不会消耗移交预算；重复检测帧（总数超清台上限被
+          _stage_validate 拦截）根本到不了这里。
+        """
+        present = [c for c in COLOR_ORDER if any(b.label == c for b in balls)]
+        for c in COLOR_ORDER:
+            self._color_streak[c] = (self._color_streak.get(c, 0) + 1
+                                     if c in present else 0)
+        if self.clear_target in present:
+            self._clear_missing = 0
+            for c in present:
+                if (COLOR_ORDER.index(c) < COLOR_ORDER.index(self.clear_target)
+                        and self._color_streak.get(c, 0) >= self._STREAK_CONFIRM):
+                    self.clear_target = c
+                    break
+        elif self.clear_target is None:
+            self.clear_target = present[0] if present else None
+            self._clear_missing = 0
+        elif self._clear_missing >= self._CLEAR_MISS_TOLERANCE:
+            self.clear_target = present[0] if present else None
+            self._clear_missing = 0
+        else:
+            self._clear_missing += 1
 
     def pulse_color(self, balls: Sequence) -> str:
         """Q 键入口：下一杆改瞄彩球（任选）；打完该杆自动回落。
@@ -323,7 +373,8 @@ def best_target_shot(plans: Sequence[physics.Shot], w: Optional[float] = None,
 def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
                   r: float, w: float, h: float, cfg,
                   prefer: Optional[physics.Point] = None,
-                  ball_on: Optional[str] = None) -> Tuple[Optional[object], str, str]:
+                  ball_on: Optional[str] = None,
+                  clear_target: Optional[str] = None) -> Tuple[Optional[object], str, str]:
     """选择目标球。
 
     返回 (target_ball, phase, 说明文字)；target_ball 为 None 表示该阶段无可行目标。
@@ -441,7 +492,16 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
         return None, "color", "红后任选彩球：所有彩球暂无可行方案"
 
     # 清彩阶段必须严格按分值顺序：绝不允许跳过低分球打高分球（实战犯规送分）。
-    tb = next_color(balls)
+    # 有锁定目标（TurnTracker 滞回）时优先锁定球；锁定球短暂漏检时宁可
+    # 本帧不出线，也不跳到下一颗——错序的线比缺一条线更糟。
+    tb = None
+    if clear_target:
+        tb = next((b for b in balls if b.label == clear_target), None)
+        if tb is None:
+            v0 = COLOR_VALUE.get(clear_target, 0)
+            return None, "color", f"清彩阶段：锁定{clear_target}（{v0} 分），漏检恢复中"
+    if tb is None:
+        tb = next_color(balls)
     if tb is None:
         return None, "color", "清彩阶段：场上无彩球"
     v = COLOR_VALUE[tb.label]
