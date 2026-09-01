@@ -774,7 +774,64 @@ def transient_ui_mask(warped: np.ndarray, cfg, r: float,
     # Dilation must not grow back over a verified cue ball.
     if protected is not None:
         ui[protected > 0] = 0
+    # v3.10.2：彩球实心盘整体豁免。foreign 掩膜天然包含球色像素（仅
+    # 红球 rack 被排除），游戏自带瞄准轨迹/计分动效/杆影一旦与球身
+    # 接触成组并被判为 UI，clean_background 会把整颗球涂成中性灰——
+    # 实机清彩帧 user_report_blue.png 复现：UI 掩膜吃掉蓝球盘 97%，
+    # 蓝球失踪，清彩顺序直接跳到粉/黑。实球绝不是界面，经形状校验
+    # 的彩球盘在此整体移除。
+    colored = _verified_colored_ball_mask(hsv, r, label_masks=label_masks)
+    if colored.any():
+        ui[colored > 0] = 0
     return ui
+
+
+def _verified_colored_ball_mask(hsv: np.ndarray, r: float,
+                                label_masks: Optional[Dict[str, np.ndarray]] = None
+                                ) -> np.ndarray:
+    """高置信彩球实心盘掩膜（transient UI 豁免用，v3.10.2）。
+
+    与 _verified_white_ball_mask 并列，但只走「颜色 + 形状」：彩球色板
+    掩膜本身即高置信（台呢不在任何彩球色域内），再用实心盘形状门控
+    （面积≈πr²、bbox 约 2r 方圆、填充率≥0.60）把文字笔画、星形图标、
+    连线排除。黑球不适用：袋洞与黑球同色同形，豁免袋洞会让 pocket 位
+    置复活为黑球误检；白球沿用既有的连通域+距离变换验证。
+    """
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    # 先小开运算切断球身与细线/笔画的熔连，球体成为独立连通域。
+    k_open = max(3, int(round(0.45 * r)) | 1)
+    k_out = max(3, int(round(0.6 * r)) | 1)
+    disc_area = np.pi * r * r
+    keep = np.zeros(h.shape, np.uint8)
+    for name in ("红球", "粉球", "黄球", "绿球", "棕球", "蓝球"):
+        mask = (label_masks[name]
+                if (label_masks is not None and name in label_masks)
+                else _mask_for_label(h, s, v, name))
+        if not mask.any():
+            continue
+        core = cv2.morphologyEx(
+            mask, cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open, k_open)))
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(core, 8)
+        for idx in range(1, n):
+            area = float(stats[idx, cv2.CC_STAT_AREA])
+            if not 0.45 * disc_area <= area <= 1.9 * disc_area:
+                continue
+            bw = float(stats[idx, cv2.CC_STAT_WIDTH])
+            bh = float(stats[idx, cv2.CC_STAT_HEIGHT])
+            if not (1.35 * r <= bw <= 2.9 * r
+                    and 1.35 * r <= bh <= 2.9 * r):
+                continue
+            if max(bw, bh) > 1.35 * max(1.0, min(bw, bh)):
+                continue
+            if area / max(1.0, bw * bh) < 0.60:
+                continue
+            keep[lab == idx] = 255
+    if not keep.any():
+        return keep
+    # 外扩拿回 AA 球缘与分组膨胀吃掉的边缘；0.6r 半径够不到远处笔画。
+    return cv2.dilate(keep, cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (k_out, k_out)))
 
 
 def _component_ui_box(component: np.ndarray, x: int, y: int,

@@ -124,6 +124,7 @@ evaluate_real.py    真实截图 manifest 评估（Precision/Recall + X/Y 误差
 
 ## 主要文件变更记录
 
+- v3.10.2：检测层根治清彩跳序——UI/瞄准线贴近时 transient 界面掩膜会把整颗彩球涂灰漏检，现对形状校验过的彩球实心盘整体豁免（实机帧复现修复）
 - v3.10.1：清彩目标跨帧滞回（TurnTracker.clear_target + choose_target 锁定），识别噪声不再导致清彩跳序
 - v3.10.0 `aimtool/physics.py`：袋口容错瞄准点（开口区间角平分线让点）+ 进球成功率排序（pot_success_prob）；`config.py` 新增 pocket_aim_optimize/rank_by_success/aim_sigma_units/exec_sigma_rad/kick_reliability
 - v3.9.0 `aimtool/snooker.py`：Q 脉冲改为球位位移驱动（遮挡/丢帧不再卡死在任选态）、清彩阶段恒严格按序（Q 在清彩无效，红后挑球用 G）；`main.py` update 传入 occluded 冻结
