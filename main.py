@@ -116,7 +116,7 @@ except ModuleNotFoundError as exc:
         "请在项目目录运行: python -m pip install -r requirements.txt"
     )
 
-APP_VERSION = "3.9.0"
+APP_VERSION = "3.10.0"
 
 HELP_TEXT = ("1-6 选袋口 | 0 自动 | G 点选目标球 | M 手动录入 | R 框选区域 | K 库边解围 | "
              "Q 进红后打彩球 | O 兼容键 | W 切回红球 | P 自动袋口 | B 球标注 | X 穿透 | "
@@ -1015,10 +1015,13 @@ def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
     sel_idx = manual_pocket_idx if manual_pocket_idx is not None else cfg.selected_pocket
     if sel_idx is not None and 0 <= sel_idx < len(pockets_t):
         p = pockets_t[sel_idx]
+        aim_half = (cfg.pocket_accept_ratio * r
+                    if getattr(cfg, "pocket_aim_optimize", True) else 0.0)
         direct = physics.direct_shot(
             cue_t, target_t, p, r, others,
             cue_radius=cue_radius, target_radius=target_radius,
             ghost_offset=ghost_offset,
+            aim_half_width=aim_half, table_size=(W, H),
         )
         plans: List[physics.Shot] = [direct] if direct.valid and not direct.blocked else []
         if cfg.allow_kicks and (not direct.valid or direct.blocked):
@@ -1031,6 +1034,7 @@ def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
                     pocket_clearance=pocket_clearance,
                     cue_radius=cue_radius, target_radius=target_radius,
                     ghost_offset=ghost_offset,
+                    aim_half_width=aim_half,
                 )
                 if k.valid and not k.blocked:
                     plans.append(k)
@@ -1053,7 +1057,7 @@ def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
         if plans:
             # 自动选球规则要求切角和目标到袋距离优先于总路程；沿用
             # 决策层的同一排序，避免“选中一颗球”和“显示另一条路线”。
-            ranked = snooker.rank_target_shots(plans)
+            ranked = snooker.rank_target_shots(plans, W, H, r, cfg)
             if ranked:
                 best = ranked[0]
                 shot = best
@@ -1100,7 +1104,9 @@ def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
     target_s = vision.point_table_to_screen(target_t, Hinv)
     ghost_s = vision.point_table_to_screen(shot.ghost, Hinv)
     pocket_s = vision.point_table_to_screen(shot.pocket, Hinv)
-    contact_t = physics.contact_pos(target_t, shot.pocket, r,
+    aim_t = shot.aim_point or shot.pocket          # 容错最优入袋瞄准点（斜切自动让点）
+    aim_s = vision.point_table_to_screen(aim_t, Hinv)
+    contact_t = physics.contact_pos(target_t, aim_t, r,
                                     target_radius=target_radius)
     contact_s = (vision.point_table_to_screen(contact_t, Hinv)
                  if contact_t is not None else target_s)
@@ -1114,7 +1120,7 @@ def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
     else:
         segs.append({"pts": [cue_s, ghost_s], "color": "#22c55e", "width": 2})
     segs.append({"pts": [ghost_s, target_s], "color": "#f97316", "width": 5, "dash": True})
-    segs.append({"pts": [target_s, pocket_s], "color": "#facc15", "width": 4, "dash": True})
+    segs.append({"pts": [target_s, aim_s], "color": "#facc15", "width": 4, "dash": True})
     # 白球切线轨迹：碰后母球沿切线方向滚动；指向袋口（摔袋）时用红色警示
     # 裁剪到台面矩形内（Liang-Barsky 思想）：切线过长伸出桌外会误导击球
     tdir, tfrac = physics.cue_tangent(shot)
@@ -1143,6 +1149,7 @@ def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
     # 而是当前帧半径相对配置基准的偏差；真实误差需由进球反馈标定。
     entry_cos = physics.pocket_entry_cos(shot, W, H, r)
     entry_limit = physics.pocket_entry_limit(shot, W, H, r)
+    pot_prob = physics.pot_success_prob(shot, W, H, r, cfg)
     radius_reference = float(cfg.ball_radius_ratio * W)
     radius_error = float(r - radius_reference)
     scene["aim_geometry"].update({
@@ -1154,6 +1161,8 @@ def _stage_plan(ctx: _AnalysisContext) -> Optional[Dict]:
         "entry_cos": (float(entry_cos) if entry_cos is not None else None),
         "entry_cos_min": (float(entry_limit) if entry_limit is not None else None),
         "aim_offset": [float(ghost_offset[0]), float(ghost_offset[1])],
+        "aim_point": [float(aim_t[0]), float(aim_t[1])],
+        "pot_prob": (float(pot_prob) if pot_prob is not None else None),
     })
     # 唯一瞄准操作指引：白球中心对准虚线圆（鬼球）圆心，沿绿线方向击打。
     # 目标球表面上的点/预测路径不是瞄准目标，对着它们打切角球必偏。

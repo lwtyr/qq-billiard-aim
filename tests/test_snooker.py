@@ -165,7 +165,7 @@ def _stub_shot(cut, target_to_pocket, total, blocked=False, rails=()):
 
 
 def test_auto_target_prioritizes_cut_then_pocket_then_clear_route(monkeypatch):
-    """自动选球按切角、离袋距离排序，并拒绝任何有障碍的候选。"""
+    """自动选球按进球成功率（切角/距袋/库数折算）排序，并拒绝有障碍候选。"""
     cfg = config.Config(allow_kicks=False)
     r = cfg.ball_radius_ratio * W
     cue = vision.Ball("白球", (300.0, 500.0), r)
@@ -189,7 +189,8 @@ def test_auto_target_prioritizes_cut_then_pocket_then_clear_route(monkeypatch):
     )
 
     assert selected_phase == "red"
-    assert target is red_cut       # smaller cut beats a nearer, wider-cut route
+    # v3.10 成功率排序：近袋稍大切（ttp 120）胜过远袋更小切（ttp 500）
+    assert target is red_near
     shots[id(red_blocked)] = [_stub_shot(5.0, 80.0, 700.0, blocked=False)]
     target, _, _ = snooker.choose_target(
         [cue, red_cut, red_near, red_blocked], cue, pockets, r, W, H, cfg,

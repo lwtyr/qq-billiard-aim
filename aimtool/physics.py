@@ -212,6 +212,9 @@ class Shot:
     bounce_points: List[Point] = field(default_factory=list)  # 库边反弹点（空=直球）
     rail_seq: Tuple[str, ...] = ()
     label: str = "直球"
+    # 袋口容错最优瞄准点（v3.10）：目标球实际出球方向终点位于袋口开口区间
+    # 的角平分线上；None = 瞄准袋口中心（旧行为/未启用让点）。
+    aim_point: Optional[Point] = None
 
 
 def _cut_angle(approach: Point, target_dir: Point) -> float:
@@ -264,33 +267,46 @@ def direct_shot(cue: Point, target: Point, pocket: Point, r: float,
                 max_cut_deg: float = MAX_CUT_DEG,
                 cue_radius: Optional[float] = None,
                 target_radius: Optional[float] = None,
-                ghost_offset: Point = (0.0, 0.0)) -> Shot:
-    """直球：鬼球法。返回瞄准方案；不可打（切角超限等）时 valid=False。"""
+                ghost_offset: Point = (0.0, 0.0),
+                aim_half_width: float = 0.0,
+                table_size: Optional[Tuple[float, float]] = None) -> Shot:
+    """直球：鬼球法。返回瞄准方案；不可打（切角超限等）时 valid=False。
+
+    aim_half_width>0 且给出 table_size 时，入袋瞄准点从袋口中心移到
+    「袋口开口区间角平分线」位置（斜切球自动让点，方向余量最大化）。
+    shot.pocket 始终保存袋口中心（袋口归类/索引/绘制用），实际瞄准点
+    存于 shot.aim_point；入射角过滤按真实出球方向 ghost→aim_point。
+    """
     cue_r, target_r = _resolve_radii(r, cue_radius, target_radius)
-    g = ghost_pos(target, pocket, r, cue_r, target_r, ghost_offset)
+    aim = pocket
+    if aim_half_width > 0.0 and table_size is not None:
+        aim = pocket_aim_point(target, pocket, table_size[0], table_size[1],
+                               aim_half_width, max(float(r), 1e-6))
+    g = ghost_pos(target, aim, r, cue_r, target_r, ghost_offset)
     if g is None:
         return Shot(pocket, target, (0.0, 0.0), 0.0, 0.0, 0.0, 0.0, False)
     d = normalize(sub(g, cue))
     if d is None:
         return Shot(pocket, g, (0.0, 0.0), 0.0, 0.0, 0.0, 0.0, False)
-    tdir = normalize(sub(pocket, target))
+    tdir = normalize(sub(aim, target))
     cut = _cut_angle(d, tdir)
     if cut > max_cut_deg:
         # 薄切不可行：接触时沿目标球→袋口方向的分速度≈0，进不了球
-        return Shot(pocket, g, d, dist(cue, g), dist(target, pocket),
-                    dist(cue, g) + dist(target, pocket), cut, False, label="直球")
+        return Shot(pocket, g, d, dist(cue, g), dist(target, aim),
+                    dist(cue, g) + dist(target, aim), cut, False, label="直球")
     cue_to_contact = dist(cue, g)
-    target_to_pocket = dist(target, pocket)
-    # 母球只走 cue→ghost；目标球被击出后才走 target→pocket。
-    # g→target 是两球接触几何，不是任何球心的运动路径，不能当作
-    # 障碍段，否则 rack/贴球场景会被大量误判为被挡。
+    target_to_pocket = dist(target, aim)
+    # 母球只走 cue→ghost；目标球被击出后才走 target→aim_point（袋口开口
+    # 区间的容错最优处）。g→target 是两球接触几何，不是任何球心的运动
+    # 路径，不能当作障碍段，否则 rack/贴球场景会被大量误判为被挡。
     collision_r = max(float(r), cue_r, target_r)
-    blocked, by = _path_blocked([(cue, g), (target, pocket)], others, collision_r)
+    blocked, by = _path_blocked([(cue, g), (target, aim)], others, collision_r)
     return Shot(
         pocket=pocket, ghost=g, aim_dir=d,
         cue_to_contact=cue_to_contact, target_to_pocket=target_to_pocket,
         total=cue_to_contact + target_to_pocket, cut_deg=cut,
         valid=True, blocked=blocked, blocked_by=by, label="直球",
+        aim_point=(aim if aim_half_width > 0.0 else None),
     )
 
 
@@ -303,14 +319,20 @@ def kick_shot(cue: Point, target: Point, pocket: Point, r: float,
               pocket_clearance: float = 0.0,
               cue_radius: Optional[float] = None,
               target_radius: Optional[float] = None,
-              ghost_offset: Point = (0.0, 0.0)) -> Shot:
+              ghost_offset: Point = (0.0, 0.0),
+              aim_half_width: float = 0.0) -> Shot:
     """库边解围：unfolding 求出发方向，再在实空间仿真验证反弹序列。
 
     rails 为期望依次触碰的库边，如 ("top",) 一库，("right", "bottom") 两库。
     仿真校验：实际反弹序列必须与 rails 完全一致，且最终到达真实鬼球附近。
+    aim_half_width>0 时鬼球按袋口容错最优瞄准点计算（同 direct_shot 让点）。
     """
     cue_r, target_r = _resolve_radii(r, cue_radius, target_radius)
-    g = ghost_pos(target, pocket, r, cue_r, target_r, ghost_offset)
+    aim = pocket
+    if aim_half_width > 0.0:
+        aim = pocket_aim_point(target, pocket, w, h, aim_half_width,
+                               max(float(r), 1e-6))
+    g = ghost_pos(target, aim, r, cue_r, target_r, ghost_offset)
     if g is None:
         return Shot(pocket, target, (0.0, 0.0), 0.0, 0.0, 0.0, 0.0, False, rail_seq=tuple(rails))
     # unfolding：把鬼球依次镜像到展开空间。
@@ -379,34 +401,35 @@ def kick_shot(cue: Point, target: Point, pocket: Point, r: float,
         return Shot(pocket, g, (0.0, 0.0), 0.0, 0.0, 0.0, 0.0, False, rail_seq=tuple(rails))
     # 切角用最终接近方向近似
     final_dir = normalize(sub(g, pos))
-    tdir_ok = normalize(sub(pocket, target))
+    tdir_ok = normalize(sub(aim, target))
     cut = _cut_angle(final_dir, tdir_ok) if (final_dir and tdir_ok) else 0.0
     if cut > max_cut_deg:
-        return Shot(pocket, g, d, 0.0, dist(target, pocket), 0.0, cut, False,
+        return Shot(pocket, g, d, 0.0, dist(target, aim), 0.0, cut, False,
                     bounce_points=bounce_points, rail_seq=tuple(rails), label=f"{len(rails)}库")
     cue_to_contact = dist(cue, bounce_points[0]) if bounce_points else dist(cue, g)
     # 总路程 = 实际多库路径长（cue→各反弹点→鬼球）+ 目标球→袋口。
     # 之前用 dist(cue,g) 直线距离会系统性低估 → 力度偏小、排序失真。
     path_pts: List[Point] = [cue] + bounce_points + [g]
     kick_path = sum(dist(path_pts[i], path_pts[i + 1]) for i in range(len(path_pts) - 1))
-    total = kick_path + dist(target, pocket)
+    total = kick_path + dist(target, aim)
     # 母球到鬼球的各段不能提前碰到目标球；目标球碰撞后的路线还要
     # 检查其它球。目标球本身只在最后的 g→target 段作为终点，不算障碍。
     cue_legs: List[Tuple[Point, Point]] = list(zip(path_pts[:-1], path_pts[1:]))
     collision_r = max(float(r), cue_r, target_r)
     blocked, by = _path_blocked(cue_legs, list(others) + [target], collision_r)
     if not blocked:
-        # 目标球从自己的球心沿 target→pocket 方向运动；g→target
+        # 目标球从自己的球心沿 target→aim_point 方向运动；g→target
         # 只是接触关系，不是目标球或母球的运动轨迹。
-        object_legs = [(target, pocket)]
+        object_legs = [(target, aim)]
         blocked, by = _path_blocked(object_legs, others, collision_r)
     label = f"{len(rails)}库"
     return Shot(
         pocket=pocket, ghost=g, aim_dir=d,
-        cue_to_contact=cue_to_contact, target_to_pocket=dist(target, pocket),
+        cue_to_contact=cue_to_contact, target_to_pocket=dist(target, aim),
         total=total, cut_deg=cut, valid=True, blocked=blocked, blocked_by=by,
         bounce_points=bounce_points, rail_seq=tuple(rails),
         label=label,
+        aim_point=(aim if aim_half_width > 0.0 else None),
     )
 
 
@@ -467,6 +490,28 @@ CORNER_POCKET_MIN_COS = 0.42
 """角袋入射角限制（≤ ≈65°）。角袋沿库边抹进仍可行（cos≈0.7），阈值放宽。"""
 
 
+def _pocket_frame(p: Point, w: float, h: float,
+                  edge_tolerance: float = 0.0
+                  ) -> Optional[Tuple[Point, Point, bool]]:
+    """袋口几何帧：(开口外法线 n, 开口线方向 u, 是否中袋)；非上下边袋位 None。
+
+    与入射角过滤共用的袋口归类：中袋 |p.x-w/2| < 0.25w、法线垂直库边；
+    角袋法线取对角方向。袋口允许精修/用户偏移（edge_tolerance 容差内
+    仍按原归类），让点/偏移永远不会使袋口逃出归类（v3.8 前的过滤
+    绕过缺陷不因此复发）。
+    """
+    edge_tolerance = max(0.0, float(edge_tolerance))
+    if not (p[1] <= edge_tolerance or p[1] >= h - edge_tolerance):
+        return None
+    at_top = p[1] <= edge_tolerance
+    if abs(p[0] - w / 2.0) < 0.25 * w:
+        return (0.0, -1.0 if at_top else 1.0), (1.0, 0.0), True
+    nx = -1.0 if p[0] < w / 2.0 else 1.0
+    ny = -1.0 if at_top else 1.0
+    length = math.hypot(nx, ny)
+    return (nx / length, ny / length), (-ny / length, nx / length), False
+
+
 def pocket_entry_cos(shot: Shot, w: float, h: float,
                      edge_tolerance: float = 0.0) -> Optional[float]:
     """Return the signed pocket-entry cosine used by the geometry filter.
@@ -475,20 +520,17 @@ def pocket_entry_cos(shot: Shot, w: float, h: float,
     a tangential approach.  ``None`` means this is not one of the standard
     top/bottom pocket positions, so the entry angle is intentionally not
     constrained by this model.
+
+    真实出球方向是 ghost→aim_point（v3.10 起瞄准点可能从袋口中心让位到
+    容错最优处）；袋口归类始终基于 shot.pocket（袋口中心），因此让点
+    永远不会绕过入射角过滤。
     """
-    p, g = shot.pocket, shot.ghost
-    edge_tolerance = max(0.0, float(edge_tolerance))
-    if not (p[1] <= edge_tolerance or p[1] >= h - edge_tolerance):
+    frame = _pocket_frame(shot.pocket, w, h, edge_tolerance)
+    if frame is None:
         return None
-    at_top = p[1] <= edge_tolerance
-    if abs(p[0] - w / 2.0) < 0.25 * w:
-        n = (0.0, -1.0 if at_top else 1.0)
-    else:
-        nx = -1.0 if p[0] < w / 2.0 else 1.0
-        ny = -1.0 if at_top else 1.0
-        length = math.hypot(nx, ny)
-        n = (nx / length, ny / length)
-    d = sub(p, g)
+    n = frame[0]
+    travel = shot.aim_point or shot.pocket
+    d = sub(travel, shot.ghost)
     length = math.hypot(d[0], d[1])
     if length < 1e-9:
         return 1.0
@@ -536,7 +578,8 @@ def plan_shots(cue: Point, target: Point, pockets: Sequence[Point], r: float,
                pocket_clearance: float = 0.0,
                cue_radius: Optional[float] = None,
                target_radius: Optional[float] = None,
-               ghost_offset: Point = (0.0, 0.0)) -> List[Shot]:
+               ghost_offset: Point = (0.0, 0.0),
+               pocket_aim_half: float = 0.0) -> List[Shot]:
     """对每个袋口生成可执行的直球/库边方案并按优先级与路程排序。
 
     排序：直球 < 一库 < 两库；同级按总路程升序。
@@ -547,7 +590,8 @@ def plan_shots(cue: Point, target: Point, pockets: Sequence[Point], r: float,
         s = direct_shot(cue, target, p, r, others,
                         cue_radius=cue_radius,
                         target_radius=target_radius,
-                        ghost_offset=ghost_offset)
+                        ghost_offset=ghost_offset,
+                        aim_half_width=pocket_aim_half, table_size=(w, h))
         if s.valid:
             plans.append(s)
         if allow_kicks:
@@ -559,7 +603,8 @@ def plan_shots(cue: Point, target: Point, pockets: Sequence[Point], r: float,
                               pocket_clearance=pocket_clearance,
                               cue_radius=cue_radius,
                               target_radius=target_radius,
-                              ghost_offset=ghost_offset)
+                              ghost_offset=ghost_offset,
+                              aim_half_width=pocket_aim_half)
                 if k.valid:
                     plans.append(k)
     def key(s: Shot) -> Tuple[int, float]:
@@ -592,8 +637,9 @@ def cue_tangent(shot: Shot) -> Tuple[Point, float]:
     if ilen < 1e-9:
         return (0.0, 0.0), 0.0
     ix, iy = ix / ilen, iy / ilen
-    # 法线 = 鬼球 → 目标球（球心连线），直球时 ≈ 袋口 → 鬼球方向
-    nx, ny = shot.ghost[0] - shot.pocket[0], shot.ghost[1] - shot.pocket[1]
+    # 法线 = 鬼球 → 目标球（球心连线），直球时 ≈ 瞄准点 → 鬼球方向
+    _aim = shot.aim_point or shot.pocket
+    nx, ny = shot.ghost[0] - _aim[0], shot.ghost[1] - _aim[1]
     nlen = math.hypot(nx, ny)
     if nlen < 1e-9:
         return (0.0, 0.0), 0.0
@@ -699,3 +745,99 @@ def best_shot(plans: Sequence[Shot], table_width: float,
     """从已验证的候选路线中选最适合实际击打的一条。"""
     ranked = rank_shots(plans, table_width, max_cut_deg, **kw)
     return ranked[0] if ranked else None
+
+
+# ---------- 袋口容错瞄准点与进球成功率（v3.10） ----------
+
+
+def pocket_aim_point(target: Point, pocket: Point, w: float, h: float,
+                     half_width: float, edge_tolerance: float = 0.0) -> Point:
+    """袋口容错最优瞄准点：从目标球看开口区间 [A,B] 的内角平分线。
+
+    正对袋口：平分线自然落在袋口中心，与旧行为一致；斜切进袋：瞄准点
+    自动在开口线上让位，使出球方向到两侧袋角的夹角余量相等（最大）。
+    瞄准点即方向上容错最强的入袋点。非标准袋位/退化情形返回袋口中心。
+    """
+    frame = _pocket_frame(pocket, w, h, edge_tolerance)
+    if frame is None:
+        return pocket
+    n, u, _mid = frame
+    a = max(float(half_width), 1e-6)
+    pa = (pocket[0] - a * u[0], pocket[1] - a * u[1])
+    pb = (pocket[0] + a * u[0], pocket[1] + a * u[1])
+    da = normalize(sub(pa, target))
+    db = normalize(sub(pb, target))
+    if da is None or db is None:
+        return pocket
+    d = normalize((da[0] + db[0], da[1] + db[1]))
+    if d is None:
+        return pocket
+    # 射线 target + t·d 与开口线 pocket + s·u 求交
+    v = sub(pocket, target)
+    cross_du = d[0] * u[1] - d[1] * u[0]
+    if abs(cross_du) < 1e-9:
+        return pocket
+    t = (v[0] * u[1] - v[1] * u[0]) / cross_du
+    s = (v[0] * d[1] - v[1] * d[0]) / cross_du
+    if t <= 1e-9:
+        return pocket
+    # 平分线必在开口区间内；数值保护夹紧并预留少许袋角余量
+    s = clamp(s, -0.92 * a, 0.92 * a)
+    aim = (pocket[0] + s * u[0], pocket[1] + s * u[1])
+    if dist(aim, target) < 1e-9:
+        return pocket
+    return aim
+
+
+def pot_success_prob(shot: Shot, w: float, h: float, r: float,
+                     cfg=None) -> Optional[float]:
+    """估计进球概率 0..1（排序用相对值；-blocked/invalid 方案为 0）。
+
+    启发式模型（σ 可由真实进球反馈标定，见 PRECISION_ANALYSIS.md）：
+
+    * 方向误差 σθ：球心/映射定位误差 σ_u 分别经「母球行程」与「接触
+      法线杠杆(≈2r)」放大，加执行对齐误差 σ_exec；薄切随切角增大
+      更敏感（经验系数 (1+(cut/75°)²)）；
+    * 袋口余量 margin：出球方向与开口线交点到最近袋角的距离，再乘
+      |cos_in| 折算——斜射时同样的垂直误差在开口线上被放大；
+    * 进球率 = P(|落点误差| < margin) = erf(margin / (√2·σθ·目标球行程))；
+    * 贴近入射角阈值的路线乘 0.7+0.3·软度系数（硬过滤照旧，只是不再
+      把“刚过阈值”和“正对入袋”当同难度）；每库反弹乘 kick_reliability。
+
+    只影响路线/目标排序，不改变任何几何有效性判定。
+    """
+    if not shot.valid or shot.blocked:
+        return 0.0
+    sigma_u = float(getattr(cfg, "aim_sigma_units", 1.0)) if cfg else 1.0
+    sigma_exec = float(getattr(cfg, "exec_sigma_rad", 0.004)) if cfg else 0.004
+    kick_rel = float(getattr(cfg, "kick_reliability", 0.92)) if cfg else 0.92
+    r_sum = max(2.0 * float(r), 1e-6)
+    d1 = max(float(shot.cue_to_contact), r_sum)
+    dir_sigma = math.sqrt((sigma_u / d1) ** 2 + (sigma_u / r_sum) ** 2
+                          + sigma_exec ** 2)
+    dir_sigma *= 1.0 + (min(float(shot.cut_deg), 85.0) / 75.0) ** 2
+
+    accept = float(getattr(cfg, "pocket_accept_ratio", 1.45)) if cfg else 1.45
+    edge_tol = max(float(r), 1e-6)
+    frame = _pocket_frame(shot.pocket, w, h, edge_tol)
+    cos_in = pocket_entry_cos(shot, w, h, edge_tol)
+    if frame is None or cos_in is None:
+        margin = 0.8 * accept * r
+    else:
+        n, u, _mid = frame
+        aim = shot.aim_point or shot.pocket
+        s = (aim[0] - shot.pocket[0]) * u[0] + (aim[1] - shot.pocket[1]) * u[1]
+        margin = (max(accept * r - abs(s), 0.05 * accept * r)
+                  * max(abs(cos_in), 0.05))
+    l2 = max(float(shot.target_to_pocket), r_sum)
+    sigma_m = dir_sigma * l2
+    if sigma_m < 1e-9:
+        return 1.0
+    p = math.erf(margin / (math.sqrt(2.0) * sigma_m))
+    limit = pocket_entry_limit(shot, w, h, edge_tol)
+    if limit is not None and cos_in is not None:
+        hardness = clamp((cos_in - limit) / 0.10, 0.0, 1.0)
+        p *= 0.7 + 0.3 * hardness
+    if shot.bounce_points:
+        p *= kick_rel ** len(shot.bounce_points)
+    return float(clamp(p, 0.0, 1.0))

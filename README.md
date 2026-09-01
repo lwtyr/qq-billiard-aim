@@ -22,6 +22,9 @@ Precision/Recall、X/Y 轴误差和径向 P50/P95。合成结果不能替代真�
 - **台呢去背景**：绿球与绿色台面同色 → 直方图峰值估计台呢色 + 球像素保护涂灰
 - **红球三角分离**：相切重叠球 → 距离峰值种子 + watershed 分水岭 + 行结构网格拟合
 - **瞄准点显示**：鬼球中心十字 + 目标球实际接触点 + 当前帧球径估计
+- **容错瞄准让点**（v3.10）：斜切球入袋瞄准点从袋口中心自动移到「开口区间角平分线」，
+  出球方向到两侧袋角的余量最大；选球/选线改按进球成功率排序
+  （袋口角余量 × 出球方向误差 × 切角/库数惩罚，`rank_by_success=False` 可回退旧规则）
 - **遮挡保护**：设置窗口、提示框、右键菜单覆盖台面时暂停输出瞄准线，避免假球误导
 - **实时管线**：捕获线程只发布最新帧，分析线程按 `analysis_fps` 消费，避免旧帧排队造成滞后；默认以约 800～850px 分析，低候选帧才启用 Hough 兜底
 - **跨帧确认**：球候选经过多帧确认和中位数稳定；球运动、稳定等待、UI 遮挡分别阻断瞄准线
@@ -119,6 +122,7 @@ evaluate_real.py    真实截图 manifest 评估（Precision/Recall + X/Y 误差
 
 ## 主要文件变更记录
 
+- v3.10.0 `aimtool/physics.py`：袋口容错瞄准点（开口区间角平分线让点）+ 进球成功率排序（pot_success_prob）；`config.py` 新增 pocket_aim_optimize/rank_by_success/aim_sigma_units/exec_sigma_rad/kick_reliability
 - v3.9.0 `aimtool/snooker.py`：Q 脉冲改为球位位移驱动（遮挡/丢帧不再卡死在任选态）、清彩阶段恒严格按序（Q 在清彩无效，红后挑球用 G）；`main.py` update 传入 occluded 冻结
 - `aimtool/vision.py`：斯诺克色板、台呢去背景、UI 掩膜、watershed 粘连分离、亚像素圆拟合、
   PCA 边带 find_table、TableTracker、红球三角行拟合

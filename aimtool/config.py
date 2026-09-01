@@ -15,8 +15,8 @@ _SAVE_LOCK = threading.Lock()
 
 @dataclass
 class Config:
-    # 配置版本。v5 修正真实截图中的袋口内缩定位。
-    pipeline_version: int = 5
+    # 配置版本。v6 新增瞄准让点/成功率评分参数。
+    pipeline_version: int = 6
     # 台面标准坐标
     table_w: float = 2000.0
     table_h: float = 1000.0
@@ -117,7 +117,14 @@ class Config:
     power_gain: float = 1.0
     power_bias: float = 0.0
     rail_energy_loss: float = 0.22        # 每库能量损耗：等效路程增幅 (1+0.22×库数)
-    pocket_accept_ratio: float = 1.45     # 袋口可接受半径 / 球半径（评分用）
+    pocket_accept_ratio: float = 1.45     # 袋口可接受半径 / 球半径（评分与瞄准让点共用）
+
+    # v3.10 瞄准优化：容错让点 + 成功率评分
+    pocket_aim_optimize: bool = True      # 斜切球瞄准点自动让到开口区间角平分线
+    rank_by_success: bool = True          # 选球/选线按进球成功率优先；False=旧切角优先
+    aim_sigma_units: float = 1.0          # 综合球心/映射定位误差 σ（标准台面单位）
+    exec_sigma_rad: float = 0.004         # 执行对齐误差 σ（弧度，≈0.23°）
+    kick_reliability: float = 0.92        # 每库反弹成功率系数（评分用，需实机标定）
 
     def save(self) -> None:
         # 检测线程与 UI 线程都可能触发保存，加锁防并发写坏文件
@@ -161,6 +168,9 @@ class Config:
                 migrated = True
             if version < 5:
                 cfg.pipeline_version = 5
+                migrated = True
+            if version < 6:
+                cfg.pipeline_version = 6
                 migrated = True
         except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
             if not isinstance(exc, FileNotFoundError):

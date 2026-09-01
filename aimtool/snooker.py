@@ -266,6 +266,8 @@ def _plan(cue, target, pockets: Sequence[physics.Point], r: float,
         float(getattr(cfg, "aim_offset_x", 0.0)),
         float(getattr(cfg, "aim_offset_y", 0.0)),
     )
+    aim_half = (float(getattr(cfg, "pocket_accept_ratio", 1.45)) * r
+                if getattr(cfg, "pocket_aim_optimize", True) else 0.0)
     return physics.plan_shots(
         cue.pos, target.pos, pockets, r, w, h, others,
         cfg.allow_kicks, cfg.max_kicks,
@@ -274,35 +276,47 @@ def _plan(cue, target, pockets: Sequence[physics.Point], r: float,
         cue_radius=cue_r,
         target_radius=target_r,
         ghost_offset=ghost_offset,
+        pocket_aim_half=aim_half,
     )
 
 
-def target_shot_key(shot: physics.Shot) -> Tuple[float, float, int, float]:
-    """自动选球的优先级：切角、目标到袋距离、库数、总路程。
+def target_shot_key(shot: physics.Shot, w: Optional[float] = None,
+                    h: Optional[float] = None, r: Optional[float] = None,
+                    cfg=None) -> Tuple[float, ...]:
+    """自动选球的优先级（v3.10）：进球成功率 → 切角 → 距袋 → 库数 → 总路程。
 
+    成功率由 physics.pot_success_prob 估计（袋口角余量 × 出球方向误差 ×
+    切角/库数惩罚），把「远袋小切」和「近袋稍大切」的真实难度区分开。
+    未传几何参数/成功率不可算时回退旧规则（切角优先，首项 0.0 恒定）。
     ``plan_shots`` 已经会过滤被挡路线；这里再次检查 ``blocked``，让决策
     层即使收到测试替身或其它规划器的结果，也绝不会把有障碍的路线推荐给
-    用户。切角和目标到袋距离严格排在总路程之前，符合实战选球顺序。
+    用户。
     """
     if not shot.valid or shot.blocked:
-        return (float("inf"), float("inf"), 999, float("inf"))
-    return (
-        float(shot.cut_deg),
-        float(shot.target_to_pocket),
-        len(shot.bounce_points),
-        float(shot.total),
-    )
+        return (float("inf"),) * 5
+    tail = (float(shot.cut_deg), float(shot.target_to_pocket),
+            float(len(shot.bounce_points)), float(shot.total))
+    if (cfg is not None and getattr(cfg, "rank_by_success", True)
+            and w and h and r):
+        p = physics.pot_success_prob(shot, float(w), float(h), float(r), cfg)
+        if p is not None:
+            return (-p,) + tail
+    return (0.0,) + tail
 
 
-def rank_target_shots(plans: Sequence[physics.Shot]) -> List[physics.Shot]:
+def rank_target_shots(plans: Sequence[physics.Shot], w: Optional[float] = None,
+                      h: Optional[float] = None, r: Optional[float] = None,
+                      cfg=None) -> List[physics.Shot]:
     """返回没有障碍的路线，并按自动选球规则排序。"""
     clear = [s for s in plans if s.valid and not s.blocked]
-    return sorted(clear, key=target_shot_key)
+    return sorted(clear, key=lambda s: target_shot_key(s, w, h, r, cfg))
 
 
-def best_target_shot(plans: Sequence[physics.Shot]) -> Optional[physics.Shot]:
+def best_target_shot(plans: Sequence[physics.Shot], w: Optional[float] = None,
+                     h: Optional[float] = None, r: Optional[float] = None,
+                     cfg=None) -> Optional[physics.Shot]:
     """取一颗目标球对应的最佳无障碍路线。"""
-    ranked = rank_target_shots(plans)
+    ranked = rank_target_shots(plans, w, h, r, cfg)
     return ranked[0] if ranked else None
 
 
@@ -313,8 +327,9 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
     """选择目标球。
 
     返回 (target_ball, phase, 说明文字)；target_ball 为 None 表示该阶段无可行目标。
-    红球阶段：逐颗红球生成方案，只保留无障碍路线，按「切角小 → 目标离袋近
-    → 库数少 → 总路程短」选择；红后任选彩球（Q 脉冲，仅红球仍在场时合法）
+    红球阶段：逐颗红球生成方案，只保留无障碍路线，按「进球成功率 → 切角小
+    → 目标离袋近 → 库数少 → 总路程短」选择（rank_by_success=False 回退旧的
+    切角优先）；红后任选彩球（Q 脉冲，仅红球仍在场时合法）
     仍按这套自动优先级；红球清完后的清彩阶段只尝试分值顺序上当前最低的
     在场彩球，绝不跳序。
 
@@ -344,10 +359,10 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
             for tb in reds:
                 plans = _plan(cue, tb, pockets, r, w, h,
                               _others(balls, cue, tb), cfg_fast)
-                shot = best_target_shot(plans)
+                shot = best_target_shot(plans, w, h, r, cfg)
                 if shot is None:
                     continue
-                key = target_shot_key(shot)
+                key = target_shot_key(shot, w, h, r, cfg)
                 if prefer is not None:
                     key = key + (physics.dist(tb.pos, prefer),)
                 else:
@@ -360,10 +375,10 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
                 for tb in reds:
                     plans = _plan(cue, tb, pockets, r, w, h,
                                   _others(balls, cue, tb), cfg)
-                    shot = best_target_shot(plans)
+                    shot = best_target_shot(plans, w, h, r, cfg)
                     if shot is None:
                         continue
-                    key = target_shot_key(shot)
+                    key = target_shot_key(shot, w, h, r, cfg)
                     if prefer is not None:
                         key = key + (physics.dist(tb.pos, prefer),)
                     else:
@@ -394,10 +409,10 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
         for tb in colors:
             plans = _plan(cue, tb, pockets, r, w, h,
                           _others(balls, cue, tb), cfg_fast)
-            shot = best_target_shot(plans)
+            shot = best_target_shot(plans, w, h, r, cfg)
             if shot is None:
                 continue
-            key = target_shot_key(shot)
+            key = target_shot_key(shot, w, h, r, cfg)
             if prefer is not None:
                 key = key + (physics.dist(tb.pos, prefer),)
             else:
@@ -410,10 +425,10 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
             for tb in colors:
                 plans = _plan(cue, tb, pockets, r, w, h,
                               _others(balls, cue, tb), cfg)
-                shot = best_target_shot(plans)
+                shot = best_target_shot(plans, w, h, r, cfg)
                 if shot is None:
                     continue
-                key = target_shot_key(shot)
+                key = target_shot_key(shot, w, h, r, cfg)
                 if prefer is not None:
                     key = key + (physics.dist(tb.pos, prefer),)
                 else:
@@ -432,7 +447,7 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
     v = COLOR_VALUE[tb.label]
     plans = _plan(cue, tb, pockets, r, w, h,
                   _others(balls, cue, tb), cfg)
-    if best_target_shot(plans) is not None:
+    if best_target_shot(plans, w, h, r, cfg) is not None:
         return tb, "color", f"清彩阶段：打{tb.label}（{v} 分）"
 
     # 若直球没有通畅线路，尝试库边解围
@@ -442,7 +457,7 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
         cfg_kicks.allow_kicks = True
         p_kicks = _plan(cue, tb, pockets, r, w, h,
                         _others(balls, cue, tb), cfg_kicks)
-        if best_target_shot(p_kicks) is not None:
+        if best_target_shot(p_kicks, w, h, r, cfg) is not None:
             return tb, "color", f"清彩阶段：打{tb.label}（{v} 分·库边解围）"
 
     # 目标球仍严格锁定为下一颗法定彩球（绝不跳顺序瞄准高分球）
