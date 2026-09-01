@@ -199,7 +199,7 @@ def test_auto_target_prioritizes_cut_then_pocket_then_clear_route(monkeypatch):
 
 
 def test_turn_tracker_q_pulse_survives_next_visual_update():
-    """Q 脉冲后下一帧不被覆盖；该杆打完自动回落红球。"""
+    """Q 脉冲后下一帧不被覆盖；该杆（位移驱动判定）打完自动回落红球。"""
     cfg = config.Config()
     r = cfg.ball_radius_ratio * W
     cue = vision.Ball("白球", (300.0, 500.0), r)
@@ -211,11 +211,13 @@ def test_turn_tracker_q_pulse_survives_next_visual_update():
     assert tracker.update(balls, stable=True) == "red"
     assert tracker.pulse_color(balls) == "color"
     assert tracker.update(balls, stable=True) == "color"   # 未开杆保持
-    assert tracker.update(balls, stable=False) == "color"  # 开杆
-    assert tracker.update(balls, stable=True) == "red"     # 打完回落
+    for b in balls:                                        # 开杆：真实位移
+        b.pos = (b.pos[0] + 150.0, b.pos[1])
+    assert tracker.update(balls, stable=False) == "color"
+    assert tracker.update(balls, stable=True) == "color"   # 停 1/2
+    assert tracker.update(balls, stable=True) == "red"     # 停 2/2：打完回落
     # 最后一颗红球落袋：无需按键，直接进入严格清彩
     assert tracker.update([cue, black], stable=True) == "clear"
-
 
 def test_q_pulse_before_first_detection_is_preserved():
     """首帧尚未产生球列表时按 Q，后续识别仍保持彩球目标状态。"""
@@ -228,17 +230,19 @@ def test_q_pulse_before_first_detection_is_preserved():
     assert tracker.update([cue, red], stable=True) == "color"
 
 
-def test_q_pulse_without_reds_falls_back_to_clear_after_shot():
-    """无红球时按 Q：任选一杆彩球（最后一颗红后规则），打完回落清彩。"""
+def test_q_pulse_without_reds_is_ignored_and_stays_strict_clear():
+    """无红球时按 Q 不再任选彩球：清彩恒严格按序（红后挑球用 G 点选）。"""
     cue = vision.Ball("白球", (300.0, 500.0), 20.0)
     yellow = vision.Ball("黄球", (700.0, 500.0), 20.0)
     tracker = snooker.TurnTracker()
 
-    assert tracker.pulse_color([cue, yellow]) == "color"
-    assert tracker.update([cue, yellow], stable=True) == "color"
-    assert tracker.update([cue, yellow], stable=False) == "color"
     assert tracker.update([cue, yellow], stable=True) == "clear"
-
+    assert tracker.pulse_color([cue, yellow]) == "clear"
+    assert tracker.update([cue, yellow], stable=True) == "clear"
+    for b in (cue, yellow):                                # 打了一杆
+        b.pos = (b.pos[0] + 150.0, b.pos[1])
+    assert tracker.update([cue, yellow], stable=False) == "clear"
+    assert tracker.update([cue, yellow], stable=True) == "clear"
 
 def test_clearance_color_order_advances_after_ball_is_removed(monkeypatch):
     """清彩阶段只按黄→绿→棕顺序，黄进袋后下一杆才到绿球。"""
@@ -271,13 +275,14 @@ def test_q_color_mode_selects_best_available_color(monkeypatch):
     cfg = config.Config(allow_kicks=False)
     r = cfg.ball_radius_ratio * W
     cue = vision.Ball("白球", (300.0, 500.0), r)
+    red = vision.Ball("红球", (1100.0, 200.0), r)          # 任选彩球仅在红球仍在场时合法
     yellow = vision.Ball("黄球", (1700.0, 500.0), r)
     green = vision.Ball("绿球", (700.0, 500.0), r)
     shot = _stub_shot(10.0, 100.0, 500.0)
     monkeypatch.setattr(snooker, "_plan", lambda *_args: [shot])
 
     target, selected_phase, _ = snooker.choose_target(
-        [cue, yellow, green], cue, physics.default_pockets(W, H), r, W, H,
+        [cue, red, yellow, green], cue, physics.default_pockets(W, H), r, W, H,
         cfg, ball_on="color")
 
     assert selected_phase == "color"
@@ -313,8 +318,8 @@ def test_snooker_decision_color_order():
     assert tb is None and phase == "color"
 
 
-def test_q_pulse_needed_for_optional_color_after_last_red():
-    """最后一颗红落袋后：默认直接清彩；按 Q 才是任选彩球（人工驱动）。"""
+def test_last_red_potted_goes_straight_to_strict_clearance():
+    """最后一颗红落袋后直接严格清彩；Q 在清彩阶段不改变目标。"""
     cfg = config.Config()
     r = cfg.ball_radius_ratio * W
     t = snooker.TurnTracker()
@@ -324,14 +329,10 @@ def test_q_pulse_needed_for_optional_color_after_last_red():
     black = vision.Ball("黑球", (1500.0, 500.0), r)
 
     assert t.update([cue, *reds, black], stable=True) == "red"
-    # 红球清零 → 默认严格清彩（用户方案：不猜状态）
+    # 红球清零 → 自动严格清彩（v3.9 起不再需要也不响应 Q）
     assert t.update([cue, black], stable=True) == "clear"
-    # 用户知道最后一颗红后该打彩球：按 Q 覆盖一杆
-    assert t.pulse_color([cue, black]) == "color"
-    assert t.update([cue, black], stable=True) == "color"
-    assert t.update([cue, black], stable=False) == "color"
+    assert t.pulse_color([cue, black]) == "clear"
     assert t.update([cue, black], stable=True) == "clear"
-
 
 def test_choose_target_explicit_color_reports_color_phase():
     cfg = config.Config()
@@ -369,3 +370,22 @@ def test_render_default_uses_snooker_palette():
     img, meta = synth.render(seed=0)
     assert img.shape[:2] == (synth.CANVAS_H, synth.CANVAS_W)
     assert all(ball["label"] in synth.POCKET_COLORS for ball in meta["balls"])
+
+
+def test_choose_target_never_breaks_clearance_order_on_stale_state(monkeypatch):
+    """结构性保险：上游 ball_on 过期/异常（red/color/None）且场上无红球时，
+    目标也必须是分值顺序的下一颗（黄球），绝不跳到黑球。"""
+    cfg = config.Config(allow_kicks=False)
+    r = cfg.ball_radius_ratio * W
+    cue = vision.Ball("白球", (300.0, 500.0), r)
+    yellow = vision.Ball("黄球", (700.0, 500.0), r)
+    black = vision.Ball("黑球", (1500.0, 500.0), r)
+    monkeypatch.setattr(snooker, "_plan",
+                        lambda *_args: [_stub_shot(3.0, 80.0, 400.0)])
+    pockets = physics.default_pockets(W, H)
+    for stale in ("red", "color", None):
+        target, selected_phase, msg = snooker.choose_target(
+            [cue, yellow, black], cue, pockets, r, W, H, cfg, ball_on=stale)
+        assert target is yellow, stale
+        assert selected_phase == "color"
+        assert "清彩" in msg and "任选" not in msg

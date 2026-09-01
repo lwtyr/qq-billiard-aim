@@ -9,7 +9,7 @@
 
 热键（Overlay 窗口激活时）：
   1-6 选择袋口 · 0 自动选袋口 · G 点选目标球 · M 手动录入(母球→目标球→袋口) · R 框选球桌区域
-  K 库边解围开关 · P 自动袋口开关 · Q 下一杆打彩球 · V 显示/隐藏鬼球 · X 鼠标穿透开关 · T 隐藏/显示 · C 重新识别 · Esc 退出
+  K 库边解围开关 · P 自动袋口开关 · Q 进红后打彩球（清彩自动按序） · V 显示/隐藏鬼球 · X 鼠标穿透开关 · T 隐藏/显示 · C 重新识别 · Esc 退出
 """
 from __future__ import annotations
 
@@ -116,10 +116,10 @@ except ModuleNotFoundError as exc:
         "请在项目目录运行: python -m pip install -r requirements.txt"
     )
 
-APP_VERSION = "3.8.2"
+APP_VERSION = "3.9.0"
 
 HELP_TEXT = ("1-6 选袋口 | 0 自动 | G 点选目标球 | M 手动录入 | R 框选区域 | K 库边解围 | "
-             "Q 下一杆打彩球 | O 兼容键 | W 切回红球 | P 自动袋口 | B 球标注 | X 穿透 | "
+             "Q 进红后打彩球 | O 兼容键 | W 切回红球 | P 自动袋口 | B 球标注 | X 穿透 | "
              "V 鬼球标记 | T 隐藏 | C 重识别 | Esc 退出")
 
 COLOR_HEX = {
@@ -873,7 +873,11 @@ def _stage_targets(ctx: _AnalysisContext) -> Optional[Dict]:
     rule_text = ""
     ball_on = None
     if turn_tracker is not None:
-        ball_on = turn_tracker.update(balls_t, table_phase == tracking.TableState.READY)
+        # 位移驱动回合判定：occluded 期间冻结计数，脉冲不再依赖帧稳定信号
+        ball_on = turn_tracker.update(
+            balls_t, table_phase == tracking.TableState.READY,
+            occluded=table_phase == tracking.TableState.UI_BLOCKED,
+        )
     if target_t is None and picked_target is not None and cue_t is not None and balls_t:
         # G 键点选的目标球优先于自动决策：把点击点吸附到最近的检测球，
         # 每帧重新吸附（球会动，点选的是「这颗球」而非固定坐标）
@@ -1618,7 +1622,7 @@ class App:
         """Q：一次性脉冲——下一杆改瞄彩球，该杆打完自动回落瞄红球。
 
         视觉无法可靠判断「进红/换手」，红后该打彩球时由用户一键控制。
-        O 键保留同一入口（旧版兼容）。
+        O 键保留同一入口（旧版兼容）；清彩阶段无效（自动严格按序）。
         """
         balls = [type("BallRef", (), {"label": b.get("label")})()
                  for b in self.scene.get("balls", [])]
@@ -1628,7 +1632,7 @@ class App:
         elif ball_on == "red":
             self.scene["hint"] = "规则状态：打红球（打进红后按 Q 切彩球）"
         else:
-            self.scene["hint"] = "规则状态：清彩顺序 黄→绿→棕→蓝→粉→黑"
+            self.scene["hint"] = "清彩阶段自动严格按 黄→绿→棕→蓝→粉→黑（指定他球用 G 点选）"
         self._redetect()
 
     def _key_switch_to_red(self) -> None:

@@ -109,6 +109,7 @@ def test_ghost_marker_hidden_by_default_but_aim_line_remains():
             return record
 
     ov = overlay_mod.Overlay.__new__(overlay_mod.Overlay)
+    ov._native = None
     ov.canvas = Canvas()
     ov._show_ghost = False
     ov._show_balls = False
@@ -253,12 +254,16 @@ def test_q_key_pulses_color_then_falls_back_to_red(monkeypatch):
     # 重复按 Q 仍是脉冲语义（不是 toggle 切回）
     app.on_key("q")
     assert app.turn_tracker.ball_on == "color"
-    # 该杆打完（动→停）→ 回落瞄红球
-    balls = [type("B", (), {"label": "白球"})(),
-             type("B", (), {"label": "红球"})(),
-             type("B", (), {"label": "黑球"})()]
-    app.turn_tracker.update(balls, stable=False)
-    assert app.turn_tracker.update(balls, stable=True) == "red"
+    # 该杆打完（球位移动后停稳两次）→ 回落瞄红球
+    balls = [type("B", (), {"label": "白球", "pos": (300.0, 500.0)})(),
+             type("B", (), {"label": "红球", "pos": (700.0, 500.0)})(),
+             type("B", (), {"label": "黑球", "pos": (1500.0, 500.0)})()]
+    app.turn_tracker.update(balls, stable=True)      # 建立球位基线
+    for _b in balls:
+        _b.pos = (_b.pos[0] + 150.0, _b.pos[1])
+    app.turn_tracker.update(balls, stable=False)     # 击球开始
+    app.turn_tracker.update(balls, stable=True)      # 停 1/2
+    assert app.turn_tracker.update(balls, stable=True) == "red"   # 停 2/2：回落
     assert "红球" in app.scene.get("hint", "红球") or True
 
 

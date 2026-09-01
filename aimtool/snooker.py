@@ -3,14 +3,17 @@
 斯诺克规则（区别于八球"打最近的球"）：
   * 红球阶段：台面上还有红球时，目标是「某颗红球」（选最好进且不被挡的）；
   * 清彩阶段：红球清完后，必须按分值顺序打彩球：黄(2)→绿(3)→棕(4)→蓝(5)→粉(6)→黑(7)。
+    清彩顺序是硬规则，任何滞留/过期的上游状态都不允许把目标带离
+    「下一颗最低分彩球」；最后一颗红后想挑其他彩球，用 G 键手动点选。
 
 只依赖识别出的球列表 + 标准 6 袋 + 台面尺寸，不依赖彩球点位知识
 （彩球复位后位置由每帧全量识别自动跟踪）。
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import ClassVar, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -24,59 +27,133 @@ VALUE_LABEL = {v: k for k, v in COLOR_VALUE.items()}
 
 @dataclass
 class TurnTracker:
-    """红/彩目标策略（v3.7 起人工驱动，不再猜状态）。
+    """红/彩目标策略（v3.9 起：位移驱动脉冲 + 清彩恒严格）。
 
-    视觉无法可靠区分「进红 / 没进球 / 犯规换手」，此前基于球数事件的
-    状态推断连出一串误判。新策略把歧义交给用户一键控制：
+    视觉无法可靠区分「进红 / 没进球 / 犯规换手」，基于球数事件的
+    状态推断早已废除，目标策略由用户一键控制：
 
     * 无人工干预：一律瞄红球；
-    * 红球清完：自动进入严格清彩顺序（黄→绿→棕→蓝→粉→黑，硬规则）；
-    * Q 键 = 一次性脉冲：下一杆改瞄彩球（红后任选，自动挑最佳彩球），
-      这一杆打完（球动过又恢复稳定）自动回落瞄红球。
+    * 红球清完：无条件严格清彩（黄→绿→棕→蓝→粉→黑，硬规则），
+      Q 在此阶段无效——最后一颗红后想挑其他彩球，用 G 键手动点选；
+    * Q 键 = 一次性脉冲（仅红球在场时有效）：下一杆改瞄彩球
+      （红后任选，自动挑最佳彩球），该杆打完自动回落瞄红球；
+    * W 键 = 强制保持红球目标，直到 Q、红球清零或重置。
+
+    脉冲的「一杆」由球位位移判定，不再依赖帧稳定信号：
+    逐次更新对同色球做最近邻匹配，最大位移超过 _SHOT_MOTION_UNITS
+    记为击球开始，连续 _STILL_UPDATES 次更新无位移记为击杆结束。
+    遮挡（occluded=True）或整帧零检测时冻结全部计数——因此漏看
+    几帧、UI 覆盖台面、检测抖动都不会让「任选彩球」泄漏到之后的杆，
+    也不会提前失效（旧版脉冲依赖「恰好被观察到的动→停稳定信号」，
+    击球过程漏看时脉冲永久卡死在任选态，清彩阶段会直奔黑球）。
 
     时序细节：打进红球后球还在滚时按 Q 是最常见的按法，脉冲必须
-    存活到「下一杆」结束 —— 用 _pulse_pending 区分「按下 Q 时球
-    正在动」：先等当前这杆结束（不清脉冲），再等脉冲杆结束才回落。
+    存活到「下一杆」结束 —— 按下 Q 时若已有击球在进行（或最近
+    一次更新画面未就绪），置 _pulse_guard，当前这杆结束不消耗脉冲。
     """
+
+    # 中位数平滑后的静止球位抖动 <1 个台面单位，真实击球至少移动
+    # 数十个单位；8（≈0.36 球半径）离两侧都有充足距离。
+    _SHOT_MOTION_UNITS: ClassVar[float] = 8.0
+    # 连续多少次更新无位移视为一杆结束（30fps 分析下约 67ms 静止）。
+    _STILL_UPDATES: ClassVar[int] = 2
 
     ball_on: Optional[str] = None      # red / color / clear
     _color_pulse: bool = False         # Q 脉冲：下一杆瞄彩球
-    _pulse_pending: bool = False       # 按下 Q 时球正在动：先等这杆结束
-    _pending_shot: bool = False        # 击杆周期：球动过 = 打过一杆
-    _force_red: bool = False           # W 强制保持红球目标，直到 Q 或重置
+    _pulse_guard: bool = False         # 按下 Q 时正在进行的一杆不消耗脉冲
+    _force_red: bool = False           # W 强制保持红球目标，直到 Q、红球清零或重置
+    _shot_active: bool = False         # 位移判定：一杆进行中
+    _still_updates: int = 0            # 连续无位移更新计数
+    _ready_hint: bool = True           # 最近一次 update 的画面就绪信号（仅 Q 时序用）
+    _prev_points: Optional[Dict[str, List[Tuple[float, float]]]] = None
 
     def reset(self) -> None:
         self.ball_on = None
         self._color_pulse = False
-        self._pulse_pending = False
-        self._pending_shot = False
+        self._pulse_guard = False
         self._force_red = False
+        self._shot_active = False
+        self._still_updates = 0
+        self._ready_hint = True
+        self._prev_points = None
 
-    def update(self, balls: Sequence, stable: bool) -> str:
+    @staticmethod
+    def _default_on(reds: int) -> str:
+        return "clear" if reds <= 0 else "red"
+
+    @staticmethod
+    def _points_by_label(balls: Sequence) -> Dict[str, List[Tuple[float, float]]]:
+        groups: Dict[str, List[Tuple[float, float]]] = {}
+        for b in balls:
+            pos = getattr(b, "pos", None)
+            if pos is None:
+                continue
+            groups.setdefault(b.label, []).append((float(pos[0]), float(pos[1])))
+        return groups
+
+    @staticmethod
+    def _max_displacement(prev: Dict[str, List[Tuple[float, float]]],
+                          cur: Dict[str, List[Tuple[float, float]]]) -> float:
+        """两帧球位的最大位移（同色最近邻匹配；红球互为等价）。
+
+        新进/消失的球不参与位移（落袋由母球等其他在场球的位移代为
+        体现），因此单帧误检、丢球不会被误判为一杆。
+        """
+        worst = 0.0
+        for label, points in cur.items():
+            rest = list(prev.get(label) or [])
+            for x, y in points:
+                if not rest:
+                    break
+                i = min(range(len(rest)),
+                        key=lambda k: (rest[k][0] - x) ** 2 + (rest[k][1] - y) ** 2)
+                px, py = rest.pop(i)
+                d = math.hypot(px - x, py - y)
+                if d > worst:
+                    worst = d
+        return worst
+
+    def update(self, balls: Sequence, stable: bool = True,
+               occluded: bool = False) -> str:
+        """每帧调用一次，返回 red / color / clear。
+
+        stable 仅是「按 Q 时画面是否可能在滚」的时序辅助信号，不再
+        决定脉冲生死；occluded=True（UI 覆盖台面）或整帧零检测时
+        冻结所有计数（不在没有事实依据时消耗脉冲或判定击杆）。
+        """
+        self._ready_hint = bool(stable)
         reds = reds_remaining(balls)
-        if not stable:
-            self._pending_shot = True
-            return self.ball_on or "red"
-        if self._pending_shot:
-            # 一杆结束（MOVING/STABILIZING → READY）。
-            self._pending_shot = False
-            if self._pulse_pending:
-                # 这是「按下 Q 时正在滚的那杆」的结束：脉冲才刚生效，
-                # 不在本杆回落。
-                self._pulse_pending = False
+        if occluded:
+            return self.ball_on or self._default_on(reds)
+        cur = self._points_by_label(balls)
+        if not cur:
+            # 零信息帧（检测全丢/全遮挡）：禁止任何决策翻转。
+            return self.ball_on or self._default_on(reds)
+        if self._prev_points is not None:
+            if self._max_displacement(self._prev_points, cur) > self._SHOT_MOTION_UNITS:
+                self._shot_active = True
+                self._still_updates = 0
             else:
-                self._color_pulse = False   # 脉冲杆打完，回落瞄红球
-        if self._force_red:
-            if reds > 0:
-                self.ball_on = "red"
-            else:
-                # 红球已清，W 的强制红球状态不应阻塞严格清彩。
-                self._force_red = False
-                self.ball_on = "color" if self._color_pulse else "clear"
-        elif reds == 0:
-            # 红球清完默认严格清彩（硬规则）；Q 脉冲可覆盖一杆——
-            # 真实规则里「最后一颗红后那一杆」本就是任选彩球。
-            self.ball_on = "color" if self._color_pulse else "clear"
+                self._still_updates += 1
+                if self._shot_active and self._still_updates >= self._STILL_UPDATES:
+                    self._shot_active = False    # 一杆结束
+                    self._still_updates = 0
+                    if self._pulse_guard:
+                        # 按下 Q 时正在滚的那一杆：脉冲刚生效，不回落
+                        self._pulse_guard = False
+                    elif self._color_pulse:
+                        self._color_pulse = False    # 脉冲杆打完，回落瞄红球
+        self._prev_points = cur
+
+        if reds <= 0:
+            # 红球清完：无条件严格清彩（硬规则）；任何滞留的脉冲 /
+            # 强制红球状态都不允许把目标带离「下一颗最低分彩球」。
+            self._color_pulse = False
+            self._pulse_guard = False
+            self._force_red = False
+            self.ball_on = "clear"
+        elif self._force_red:
+            self.ball_on = "red"
         elif self._color_pulse:
             self.ball_on = "color"
         else:
@@ -86,21 +163,28 @@ class TurnTracker:
     def pulse_color(self, balls: Sequence) -> str:
         """Q 键入口：下一杆改瞄彩球（任选）；打完该杆自动回落。
 
-        红球还在：覆盖默认的红球目标（打进红后的那一杆）。
-        红球已清：覆盖清彩顺序一杆 —— 真实规则里「最后一颗红后
-        的那一杆」本就是任选彩球，此后恢复严格顺序。
+        仅红球在场时生效。红球清完后一律严格清彩，Q 不再改变目标
+        （最后一颗红后想挑其他彩球，直接用 G 键点选）；还什么都没
+        检测到的空帧允许先押注，下一帧真实球况会自动校正（无红球
+        则立即回到严格清彩）。
         """
+        balls = list(balls)
+        if balls and reds_remaining(balls) <= 0:
+            self._color_pulse = False
+            self._pulse_guard = False
+            self.ball_on = "clear"
+            return self.ball_on
         self._force_red = False
         self._color_pulse = True
-        # 按下时球正在滚（刚打进红）→ 等这杆结束才算脉冲杆开始。
-        self._pulse_pending = self._pending_shot
+        # 按下时球正在滚（刚打进红）→ 当前这杆不消耗脉冲。
+        self._pulse_guard = self._shot_active or not self._ready_hint
         self.ball_on = "color"
         return self.ball_on
 
     def pulse_red(self) -> str:
-        """W键入口：强制切回红球，取消彩球脉冲"""
+        """W键入口：强制切回红球，取消彩球脉冲（红球清完后由 update 自动回到清彩）。"""
         self._color_pulse = False
-        self._pulse_pending = False
+        self._pulse_guard = False
         self._force_red = True
         self.ball_on = "red"
         return self.ball_on
@@ -230,20 +314,25 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
 
     返回 (target_ball, phase, 说明文字)；target_ball 为 None 表示该阶段无可行目标。
     红球阶段：逐颗红球生成方案，只保留无障碍路线，按「切角小 → 目标离袋近
-    → 库数少 → 总路程短」选择；红后任选彩球阶段仍按这套自动优先级，红球
-    清完后的清彩阶段才按分值顺序只尝试当前最低分值的在场彩球。
+    → 库数少 → 总路程短」选择；红后任选彩球（Q 脉冲，仅红球仍在场时合法）
+    仍按这套自动优先级；红球清完后的清彩阶段只尝试分值顺序上当前最低的
+    在场彩球，绝不跳序。
 
     prefer：上一帧选定的目标球位置（台面坐标），仅作为完全同级候选的
     最后平局条件，不能压过新的切角/袋口优先级。
     """
     selected_on = ball_on or ("red" if phase(balls) == "red" else "clear")
+    if selected_on == "color" and not any(b.label == "红球" for b in balls):
+        # 结构性保险：任选彩球只在红球仍在场时合法（红后一杆语义）。
+        # 红球清完后，不管上游状态如何过期/异常，一律落入严格清彩。
+        selected_on = "clear"
     if selected_on == "red":
         reds = [b for b in balls if b.label == "红球"]
         if not reds:
-            # 显式状态可能比检测帧滞后一帧；不要让目标记忆分支对空列表
-            # 调用 min() 崩溃，退回到清彩阶段的规则判断。
-            selected_on = "clear" if not any(
-                b.label in COLOR_ORDER for b in balls) else "color"
+            # 显式状态可能比检测帧滞后一帧；红球已不在场时落入严格清彩
+            # （旧版会错误地降级到「任选彩球」，滞后帧可能直接瞄准黑球），
+            # 同时避免目标记忆分支对空列表调用 min() 崩溃。
+            selected_on = "clear"
         else:
             import copy
             use_kicks = bool(getattr(cfg, "allow_kicks", True))
@@ -291,8 +380,9 @@ def choose_target(balls: Sequence, cue, pockets: Sequence[physics.Point],
 
             return None, "red", "红球阶段：所有红球暂无可行方案"
     if selected_on == "color":
-        # 红球仍在时，红后彩球是任选目标；按自动选球优先级在所有
-        # 彩球中挑选。红球清完后会由 clear 状态进入严格清彩顺序。
+        # 红球仍在场、按 Q 后的一杆：任选彩球（红后规则），仍按自动
+        # 选球优先级在所有彩球中挑选。红球清完的状态在上面已被强制
+        # 收敛到严格清彩，不可能进入本分支。
         colors = [b for b in balls if b.label in COLOR_ORDER]
         import copy
         use_kicks = bool(getattr(cfg, "allow_kicks", True))
