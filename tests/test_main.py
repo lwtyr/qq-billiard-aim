@@ -88,12 +88,51 @@ def test_overlay_does_not_force_crosshair_cursor(monkeypatch):
             self.options.update(kwargs)
 
     ov = overlay_mod.Overlay.__new__(overlay_mod.Overlay)
+    ov._native = None
     ov.canvas = Canvas()
     ov._click_through = False
     monkeypatch.setattr(overlay_mod, "TRANSPARENT_ON_NT", False)
     ov.set_click_through(True)
     assert ov._click_through is True
     assert ov.canvas.options["cursor"] == "arrow"
+
+
+def test_ghost_marker_hidden_by_default_but_aim_line_remains():
+    """默认不画鬼球圆/十字，但母球到鬼球的绿线仍然显示。"""
+    class Canvas:
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            def record(*args, **kwargs):
+                self.calls.append((name, args, kwargs))
+            return record
+
+    ov = overlay_mod.Overlay.__new__(overlay_mod.Overlay)
+    ov.canvas = Canvas()
+    ov._show_ghost = False
+    ov._show_balls = False
+    ov._region_active = False
+    scene = {
+        "segments": [{"pts": [(10, 20), (50, 60)], "color": "#22c55e", "width": 2}],
+        "ghost": {"x": 50, "y": 60, "r": 12},
+        "pockets": [], "balls": [],
+    }
+
+    ov.render(scene)
+    assert [c for c in ov.canvas.calls if c[0] == "create_oval"] == []
+    assert len([c for c in ov.canvas.calls if c[0] == "create_line"]) == 1
+
+    ov.toggle_ghost()
+    ov.canvas.calls.clear()
+    ov.render(scene)
+    assert len([c for c in ov.canvas.calls if c[0] == "create_oval"]) == 1
+    assert len([c for c in ov.canvas.calls if c[0] == "create_line"]) == 3
+
+
+def test_ghost_marker_config_defaults_to_hidden():
+    """配置默认关闭鬼球标记，避免新配置文件首次启动时显示。"""
+    assert config.Config().show_ghost is False
 
 
 def test_capture_loop_retries_without_stopping_app(monkeypatch):
