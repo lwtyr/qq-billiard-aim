@@ -150,6 +150,7 @@ class Overlay:
         self._wndproc = None
         self._visible = True
         self._show_balls = False        # 默认极简：只画母球/目标球/瞄准线
+        self._show_ghost = False       # 默认隐藏鬼球圆和中心十字，绿线仍保留
         self._verify_left = 0           # 映射后复查次数（Windows 上在下方赋值）
         self._key_queue = None          # 延迟创建（见下）
         if TRANSPARENT_ON_NT:
@@ -272,7 +273,7 @@ class Overlay:
     _HOTKEYS = {
         "1": "1", "2": "2", "3": "3", "4": "4", "5": "5", "6": "6",
         "0": "0", "g": "g", "m": "m", "r": "r", "k": "k", "p": "p", "o": "o", "b": "b",
-        "x": "x", "t": "t", "c": "c", "q": "q", "w": "w",
+        "x": "x", "t": "t", "c": "c", "q": "q", "w": "w", "v": "v",
     }
     _VK_EXTRA = {0x1B: "escape", 0x7B: "f12"}
 
@@ -541,17 +542,28 @@ class Overlay:
         self._show_balls = not self._show_balls
         return self._show_balls
 
+    def set_show_ghost(self, visible: bool) -> None:
+        """设置鬼球调试标记是否可见。"""
+        self._show_ghost = bool(visible)
+
+    def toggle_ghost(self) -> bool:
+        """切换鬼球虚线圆和中心十字的显示状态。"""
+        self._show_ghost = not self._show_ghost
+        return self._show_ghost
+
     # ---------- 渲染 ----------
     def render(self, scene: Dict) -> None:
         if self._native is not None:
             # 原生分层窗口：PIL 直接画在位图上，alpha=0 像素点击恒穿透
+            native_scene = dict(scene)
+            native_scene["show_ghost"] = self._show_ghost
             region = None
             if self._region_active and self._region_start and self._region_current:
                 x0, y0 = self._region_start
                 x1, y1 = self._region_current
                 region = (x0, y0, x1, y1)
             try:
-                self._native.draw(scene, region)
+                self._native.draw(native_scene, region)
             except Exception as exc:
                 print(f"[overlay] 原生渲染异常: {type(exc).__name__}: {exc}",
                       flush=True)
@@ -622,19 +634,19 @@ class Overlay:
                               b["x"] + r * 0.6, b["y"] + r * 0.6,
                               outline=b.get("color", "#94a3b8"), width=1)
 
-        # 鬼球（绿色虚线圆 + 中心十字）—— 唯一瞄准目标
-        g = scene.get("ghost")
-        if g:
-            r = g.get("r", scene.get("ball_r", 12))
-            c.create_oval(g["x"] - r, g["y"] - r, g["x"] + r, g["y"] + r,
-                          outline=C_GHOST, width=2, dash=(10, 7))
-            # 鬼球中心是母球中心的瞄准点，用十字标出，避免只看虚线圆
-            # 时无法判断应对准哪个像素。
-            arm = max(5.0, min(10.0, 0.35 * r))
-            c.create_line(g["x"] - arm, g["y"], g["x"] + arm, g["y"],
-                          fill=C_GHOST, width=2)
-            c.create_line(g["x"], g["y"] - arm, g["x"], g["y"] + arm,
-                          fill=C_GHOST, width=2)
+        # 鬼球（白色虚线圆 + 中心十字）默认隐藏；按 V 可临时显示。
+        if self._show_ghost:
+            g = scene.get("ghost")
+            if g:
+                r = g.get("r", scene.get("ball_r", 12))
+                c.create_oval(g["x"] - r, g["y"] - r, g["x"] + r, g["y"] + r,
+                              outline=C_GHOST, width=2, dash=(10, 7))
+                # 调试显示时标出鬼球中心，便于核对几何位置。
+                arm = max(5.0, min(10.0, 0.35 * r))
+                c.create_line(g["x"] - arm, g["y"], g["x"] + arm, g["y"],
+                              fill=C_GHOST, width=2)
+                c.create_line(g["x"], g["y"] - arm, g["x"], g["y"] + arm,
+                              fill=C_GHOST, width=2)
 
         # 接触点只画成目标球上的小点，便于检查几何方向；真正的瞄准
         # 目标仍是上面的鬼球中心十字，不是这个点。

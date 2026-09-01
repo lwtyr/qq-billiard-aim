@@ -43,6 +43,8 @@ class Config:
     selected_pocket: int = -1             # -1=自动；0..5 指定
     allow_kicks: bool = True              # 直球被挡时是否给出库边解围
     max_kicks: int = 2
+    # 鬼球虚线圆和中心十字默认隐藏；需要检查瞄准点时可按 V 临时显示。
+    show_ghost: bool = False
 
     # 视觉调参（一般不用动）
     # 台呢绿色：实测 QQ2D桌球 台呢 H≈57。范围必须收窄——过宽会把含

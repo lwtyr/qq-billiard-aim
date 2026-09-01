@@ -9,7 +9,7 @@
 
 热键（Overlay 窗口激活时）：
   1-6 选择袋口 · 0 自动选袋口 · G 点选目标球 · M 手动录入(母球→目标球→袋口) · R 框选球桌区域
-  K 库边解围开关 · P 自动袋口开关 · Q 下一杆打彩球 · X 鼠标穿透开关 · T 隐藏/显示 · C 重新识别 · Esc 退出
+  K 库边解围开关 · P 自动袋口开关 · Q 下一杆打彩球 · V 显示/隐藏鬼球 · X 鼠标穿透开关 · T 隐藏/显示 · C 重新识别 · Esc 退出
 """
 from __future__ import annotations
 
@@ -120,7 +120,7 @@ APP_VERSION = "3.8.2"
 
 HELP_TEXT = ("1-6 选袋口 | 0 自动 | G 点选目标球 | M 手动录入 | R 框选区域 | K 库边解围 | "
              "Q 下一杆打彩球 | O 兼容键 | W 切回红球 | P 自动袋口 | B 球标注 | X 穿透 | "
-             "T 隐藏 | C 重识别 | Esc 退出")
+             "V 鬼球标记 | T 隐藏 | C 重识别 | Esc 退出")
 
 COLOR_HEX = {
     "白球": "#ebebef",
@@ -1512,6 +1512,7 @@ class App:
             "x": self._key_toggle_click_through,
             "t": self._key_toggle_overlay,
             "b": self._key_toggle_balls,
+            "v": self._key_toggle_ghost,
             "c": self._redetect,
             "f12": self._key_dump_state,
         }
@@ -1654,6 +1655,14 @@ class App:
             on = self.overlay.toggle_balls()
             self.scene["hint"] = "全球标注：开" if on else "极简模式：仅母球/目标球"
             self._redetect()
+
+    def _key_toggle_ghost(self) -> None:
+        """V：切换鬼球虚线圆和中心十字，仅用于调试瞄准几何。"""
+        if self.overlay:
+            on = self.overlay.toggle_ghost()
+            self.cfg.show_ghost = on
+            self.cfg.save()
+            self.scene["hint"] = "鬼球标记：开" if on else "鬼球标记：关（绿线保留）"
 
     def _key_dump_state(self) -> None:
         """F12：打印当前运行状态。"""
@@ -1820,6 +1829,8 @@ class App:
         from aimtool.overlay import Overlay          # 延迟导入：无显示环境（demo）不依赖 tk
 
         self.overlay = Overlay(self.on_key, self.on_click, self.on_drag, self.on_drag_end)
+        # 配置默认关闭鬼球标记；按 V 可临时打开调试显示。
+        self.overlay.set_show_ghost(self.cfg.show_ghost)
         self._set_click_through(self.mode != "manual")
         threading.Thread(target=self._capture_loop, daemon=True).start()
         threading.Thread(target=self._detect_loop, daemon=True).start()

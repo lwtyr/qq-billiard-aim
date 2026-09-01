@@ -386,17 +386,17 @@ class NativeLayer:
                 # 目标球亮橙外圈隐藏；contact 小点仍在下方单独绘制。
                 pass
 
-        # 鬼球（绿色虚线圆 + 中心十字）—— 唯一瞄准目标：白球中心
-        # 要穿过虚线圆的圆心，而不是打目标球表面上的点。
-        g = scene.get("ghost")
-        if g:
-            r = float(g.get("r", scene.get("ball_r", 12)))
-            gx, gy = float(g["x"]), float(g["y"])
-            circ = self._circle_points(gx, gy, r, 64)
-            self._dashed(d, circ, C_GHOST, 2, (10, 7))
-            arm = max(5.0, min(10.0, 0.35 * r))
-            d.line([(gx - arm, gy), (gx + arm, gy)], fill=C_GHOST, width=2)
-            d.line([(gx, gy - arm), (gx, gy + arm)], fill=C_GHOST, width=2)
+        # 鬼球默认隐藏；Overlay 会在需要调试时把 show_ghost 注入 scene。
+        if scene.get("show_ghost"):
+            g = scene.get("ghost")
+            if g:
+                r = float(g.get("r", scene.get("ball_r", 12)))
+                gx, gy = float(g["x"]), float(g["y"])
+                circ = self._circle_points(gx, gy, r, 64)
+                self._dashed(d, circ, C_GHOST, 2, (10, 7))
+                arm = max(5.0, min(10.0, 0.35 * r))
+                d.line([(gx - arm, gy), (gx + arm, gy)], fill=C_GHOST, width=2)
+                d.line([(gx, gy - arm), (gx, gy + arm)], fill=C_GHOST, width=2)
 
         # 接触点只画成目标球上的小点，供检查目标方向；实际瞄准仍看
         # 鬼球中心十字，不能把这个点当作母球中心。
