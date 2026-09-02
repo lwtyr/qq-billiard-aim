@@ -16,6 +16,41 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+
+import cv2
+import numpy as np
+
+class SimpleKalman:
+    def __init__(self):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
+        self.kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+        self.initialized = False
+
+    def update(self, x, y):
+        if not self.initialized:
+            self.kf.statePre = np.array([[x], [y], [0], [0]], np.float32)
+            self.kf.statePost = np.array([[x], [y], [0], [0]], np.float32)
+            self.initialized = True
+            return x, y
+        measured = np.array([[np.float32(x)], [np.float32(y)]])
+        self.kf.correct(measured)
+        pred = self.kf.predict()
+        return float(pred[0, 0]), float(pred[1, 0])
+
+_kalman_filters = {}
+
+def _kalman_point(state: dict, key: str, cur, alpha=0.5, max_jump=20.0):
+    if key not in _kalman_filters:
+        _kalman_filters[key] = SimpleKalman()
+    kf = _kalman_filters[key]
+    if cur is None:
+        kf.initialized = False
+        return None
+    px, py = kf.update(cur[0], cur[1])
+    return (px, py)
+
 import threading
 import time
 import traceback
@@ -363,19 +398,6 @@ def _occ_streak_hit(state: Dict, bbox) -> int:
         state["bbox"] = tuple(bbox)
         state["n"] = 1
     return state["n"]
-
-
-def _ema_point(state: Dict, key: str, cur: physics.Point,
-               jump: float, alpha: float = 0.5) -> physics.Point:
-    """带跳变保护的逐帧 EMA。球被切换/窗口移动时直接跟随，避免把真位移糊掉。"""
-    prev = state.get(key)
-    if prev is None or physics.dist(cur, prev) > jump:
-        state[key] = cur
-        return cur
-    blended = (alpha * cur[0] + (1.0 - alpha) * prev[0],
-               alpha * cur[1] + (1.0 - alpha) * prev[1])
-    state[key] = blended
-    return blended
 
 
 def _ema_scalar(state: Dict, key: str, cur: float, alpha: float = 0.5,
@@ -923,8 +945,8 @@ def _stage_targets(ctx: _AnalysisContext) -> Optional[Dict]:
     # 治标——球心噪声经鬼球几何放大成线的晃动；源头平滑才治本。
     # 跳变保护（4r）保证换球/窗口移动时立即跟随，不会把真位移糊掉。
     if smooth is not None and ball_tracker is None:
-        cue_t = _ema_point(smooth, "cue", cue_t, 4.0 * r)
-        target_t = _ema_point(smooth, "target", target_t, 4.0 * r)
+        cue_t = _kalman_point(smooth, "cue", cue_t, 4.0 * r)
+        target_t = _kalman_point(smooth, "target", target_t, 4.0 * r)
 
     # 障碍球 = 除母球/目标球外的所有球
     others: List[physics.Point] = []
